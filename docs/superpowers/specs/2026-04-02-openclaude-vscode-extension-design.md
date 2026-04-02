@@ -19,6 +19,30 @@ A VS Code extension that provides a full-featured AI coding assistant UI by wrap
 
 OpenClaude is a fork of Claude Code that adds an OpenAI-compatible shim (786 lines, 6 files changed), enabling any LLM via the OpenAI Chat Completions API — GPT-4o, Gemini, DeepSeek, Ollama, and 200+ models. It has the same CLI interface, tools, and capabilities as Claude Code.
 
+### 1.1 Reuse Strategy
+
+**Reuse everything from Claude Code's extension. Only write new code where extraction is impractical.**
+
+For every story: first deminify and extract the equivalent from Claude Code's `extension.js` (101KB) and `webview/index.js` (198KB), then rebrand and adapt. Build fresh only for React component internals where minified JSX is unreadable.
+
+**Direct copy + rebrand:**
+- `package.json` — all commands, keybindings, settings, views, menus
+- `claude-code-settings.schema.json` — full 70+ property settings schema
+- `resources/walkthrough/*.md` — onboarding content
+- `resources/*.svg` — icons (rebrand)
+- Plan review HTML (lines 340-690 of extension.js — extractable as-is)
+
+**Deminify and extract:**
+- Process spawn logic, NDJSON parser, diff provider, MCP IDE server, postMessage protocol, status bar, command registration — all extractable from extension.js with a formatter
+
+**Build fresh (referencing minified code for behavior):**
+- React webview components — the minified JSX is unreadable, but we match the exact layout, classes, and behavior by using the minified code as a visual/behavioral reference
+
+**Reference locations:**
+- Claude Code extension: `~/.vscode/extensions/anthropic.claude-code-2.1.85-darwin-arm64/`
+- OpenClaude CLI source: `~/Documents/workspace/openclaude/`
+- SDK protocol schemas: `openclaude/src/entrypoints/sdk/controlSchemas.ts`
+
 ---
 
 ## 2. Architecture
