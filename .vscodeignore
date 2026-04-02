@@ -1,0 +1,15 @@
+src/**
+webview/src/**
+webview/node_modules/**
+test/**
+docs/**
+.eslintrc.json
+.prettierrc
+tsconfig.json
+esbuild.config.mjs
+webview/vite.config.ts
+webview/tailwind.config.ts
+webview/tsconfig.json
+webview/index.html
+webview/postcss.config.js
+**/*.map
