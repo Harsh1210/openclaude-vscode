@@ -1,0 +1,488 @@
+{
+	"name": "openclaude-vscode",
+	"displayName": "OpenClaude VS Code",
+	"description": "OpenClaude VS Code: AI coding assistant powered by any LLM",
+	"version": "0.1.0",
+	"publisher": "Harsh1210",
+	"license": "MIT",
+	"bugs": {
+		"url": "https://github.com/Harsh1210/openclaude-vscode/issues"
+	},
+	"engines": {
+		"vscode": "^1.94.0"
+	},
+	"categories": [
+		"AI",
+		"Chat"
+	],
+	"keywords": [
+		"claude",
+		"sonnet",
+		"ai",
+		"mcp",
+		"agent"
+	],
+	"activationEvents": [
+		"onStartupFinished",
+		"onWebviewPanel:openclaudePanel"
+	],
+	"icon": "resources/openclaude-logo.png",
+	"main": "./dist/extension.js",
+	"contributes": {
+		"configuration": {
+			"title": "OpenClaude",
+			"properties": {
+				"openclaudeCode.selectedModel": {
+					"type": "string",
+					"default": "default",
+					"description": "The AI model for OpenClaude."
+				},
+				"openclaudeCode.environmentVariables": {
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"name": {
+								"type": "string",
+								"description": "Environment variable name"
+							},
+							"value": {
+								"type": "string",
+								"description": "Environment variable value"
+							}
+						},
+						"required": [
+							"name",
+							"value"
+						]
+					},
+					"default": [],
+					"description": "Environment variables to set when launching OpenClaude.\n\nPrefer setting environment variables in OpenClaude's settings.json.\nSee documentation: https://github.com/Harsh1210/openclaude-vscode"
+				},
+				"openclaudeCode.useTerminal": {
+					"type": "boolean",
+					"default": false,
+					"description": "Launch OpenClaude in the terminal instead of the native UI."
+				},
+				"openclaudeCode.allowDangerouslySkipPermissions": {
+					"type": "boolean",
+					"description": "Allow bypass permissions mode. Recommended only for sandboxes with no internet access."
+				},
+				"openclaudeCode.claudeProcessWrapper": {
+					"type": "string",
+					"description": "Executable path used to launch the OpenClaude process."
+				},
+				"openclaudeCode.respectGitIgnore": {
+					"type": "boolean",
+					"default": true,
+					"description": "Respect .gitignore files when performing file searches. Tip: You can still filter by other exclusion patterns in .ignore when this is disabled."
+				},
+				"openclaudeCode.initialPermissionMode": {
+					"type": "string",
+					"enum": [
+						"default",
+						"acceptEdits",
+						"plan",
+						"bypassPermissions"
+					],
+					"default": "default",
+					"description": "Initial permission mode for new conversations."
+				},
+				"openclaudeCode.disableLoginPrompt": {
+					"type": "boolean",
+					"default": false,
+					"description": "When true, never prompt for login/authentication in the extension. Used when authentication is handled externally."
+				},
+				"openclaudeCode.autosave": {
+					"type": "boolean",
+					"default": true,
+					"description": "Automatically save files before OpenClaude reads or writes them."
+				},
+				"openclaudeCode.useCtrlEnterToSend": {
+					"type": "boolean",
+					"default": false,
+					"description": "When enabled, use Ctrl/Cmd+Enter to send prompts instead of just Enter. This allows Enter to create new lines."
+				},
+				"openclaudeCode.preferredLocation": {
+					"type": "string",
+					"enum": [
+						"sidebar",
+						"panel"
+					],
+					"enumDescriptions": [
+						"Sidebar (Right)",
+						"Panel (New Tab)"
+					],
+					"default": "panel",
+					"description": "Where OpenClaude opens by default. This setting updates automatically when you open OpenClaude in a new location."
+				},
+				"openclaudeCode.enableNewConversationShortcut": {
+					"type": "boolean",
+					"default": false,
+					"description": "Use the Cmd/Ctrl+N keyboard shortcut to start a new conversation when OpenClaude is focused."
+				},
+				"openclaudeCode.hideOnboarding": {
+					"type": "boolean",
+					"default": false,
+					"description": "Hide the onboarding checklist in OpenClaude."
+				},
+				"openclaudeCode.usePythonEnvironment": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Automatically activate the workspace's Python environment when running OpenClaude. Requires the [Python](https://marketplace.visualstudio.com/items?itemName=ms-python.python) extension."
+				}
+			}
+		},
+		"jsonValidation": [
+			{
+				"fileMatch": [
+					"**/.claude/settings.json",
+					"**/.claude/settings.local.json",
+					"**/ClaudeCode/managed-settings.json",
+					"**/claude-code/managed-settings.json"
+				],
+				"url": "./openclaude-settings.schema.json"
+			}
+		],
+		"commands": [
+			{
+				"command": "openclaude.editor.open",
+				"title": "OpenClaude: Open in New Tab",
+				"icon": {
+					"light": "resources/openclaude-logo.svg",
+					"dark": "resources/openclaude-logo.svg"
+				}
+			},
+			{
+				"command": "openclaude.editor.openLast",
+				"title": "OpenClaude: Open",
+				"icon": {
+					"light": "resources/openclaude-logo.svg",
+					"dark": "resources/openclaude-logo.svg"
+				}
+			},
+			{
+				"command": "openclaude.primaryEditor.open",
+				"title": "OpenClaude: Open in Primary Editor",
+				"icon": {
+					"light": "resources/openclaude-logo.svg",
+					"dark": "resources/openclaude-logo.svg"
+				}
+			},
+			{
+				"command": "openclaude.window.open",
+				"title": "OpenClaude: Open in New Window"
+			},
+			{
+				"command": "openclaude.createWorktree",
+				"title": "OpenClaude: Create Worktree"
+			},
+			{
+				"command": "openclaude.sidebar.open",
+				"title": "OpenClaude: Open in Side Bar",
+				"icon": {
+					"light": "resources/openclaude-logo.svg",
+					"dark": "resources/openclaude-logo.svg"
+				}
+			},
+			{
+				"command": "openclaude.newConversation",
+				"title": "OpenClaude: New Conversation"
+			},
+			{
+				"command": "openclaude.update",
+				"title": "OpenClaude: Update extension"
+			},
+			{
+				"command": "openclaude.focus",
+				"title": "OpenClaude: Focus input"
+			},
+			{
+				"command": "openclaude.blur",
+				"title": "OpenClaude: Blur input"
+			},
+			{
+				"command": "openclaude.logout",
+				"title": "OpenClaude: Logout"
+			},
+			{
+				"command": "openclaude.terminal.open",
+				"title": "OpenClaude: Open in Terminal",
+				"icon": {
+					"light": "resources/openclaude-logo.svg",
+					"dark": "resources/openclaude-logo.svg"
+				}
+			},
+			{
+				"command": "openclaude.acceptProposedDiff",
+				"title": "OpenClaude: Accept Proposed Changes",
+				"enablement": "openclaude.viewingProposedDiff",
+				"icon": "$(check)"
+			},
+			{
+				"command": "openclaude.rejectProposedDiff",
+				"title": "OpenClaude: Reject Proposed Changes",
+				"enablement": "openclaude.viewingProposedDiff",
+				"icon": "$(discard)"
+			},
+			{
+				"command": "openclaude.insertAtMention",
+				"title": "OpenClaude: Insert @-Mention Reference"
+			},
+			{
+				"command": "openclaude.installPlugin",
+				"title": "OpenClaude: Install Plugin"
+			},
+			{
+				"command": "openclaude.insertAtMentioned",
+				"title": "OpenClaude: Insert At-Mentioned"
+			},
+			{
+				"command": "openclaude.showLogs",
+				"title": "OpenClaude: Show Logs"
+			},
+			{
+				"command": "openclaude.openWalkthrough",
+				"title": "OpenClaude: Open Walkthrough"
+			}
+		],
+		"keybindings": [
+			{
+				"command": "openclaude.insertAtMention",
+				"key": "alt+k",
+				"mac": "alt+k",
+				"when": "editorTextFocus"
+			},
+			{
+				"command": "openclaude.focus",
+				"key": "cmd+escape",
+				"mac": "cmd+escape",
+				"win": "ctrl+escape",
+				"linux": "ctrl+escape",
+				"when": "!config.openclaudeCode.useTerminal && editorTextFocus"
+			},
+			{
+				"command": "openclaude.blur",
+				"key": "cmd+escape",
+				"mac": "cmd+escape",
+				"win": "ctrl+escape",
+				"linux": "ctrl+escape",
+				"when": "!config.openclaudeCode.useTerminal && !editorTextFocus"
+			},
+			{
+				"command": "openclaude.editor.open",
+				"key": "cmd+shift+escape",
+				"mac": "cmd+shift+escape",
+				"win": "ctrl+shift+escape",
+				"linux": "ctrl+shift+escape",
+				"when": "!config.openclaudeCode.useTerminal"
+			},
+			{
+				"command": "openclaude.terminal.open.keyboard",
+				"key": "cmd+escape",
+				"mac": "cmd+escape",
+				"win": "ctrl+escape",
+				"linux": "ctrl+escape",
+				"when": "config.openclaudeCode.useTerminal"
+			},
+			{
+				"command": "openclaude.insertAtMentioned",
+				"key": "cmd+alt+K",
+				"mac": "cmd+alt+K",
+				"win": "ctrl+alt+K",
+				"linux": "ctrl+alt+K",
+				"when": "editorTextFocus"
+			},
+			{
+				"command": "openclaude.newConversation",
+				"key": "cmd+n",
+				"mac": "cmd+n",
+				"win": "ctrl+n",
+				"linux": "ctrl+n",
+				"when": "config.openclaudeCode.enableNewConversationShortcut && (activeWebviewPanelId == 'openclaudePanel' || (openclaude.sideBarActive && !editorFocus && !panelFocus))"
+			}
+		],
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "openclaude-sidebar",
+					"title": "OpenClaude",
+					"icon": "resources/openclaude-logo.svg",
+					"when": "openclaude:doesNotSupportSecondarySidebar"
+				},
+				{
+					"id": "openclaude-sessions-sidebar",
+					"title": "OpenClaude",
+					"icon": "resources/openclaude-logo.svg",
+					"when": "openclaude.sessionsListEnabled"
+				}
+			],
+			"secondarySidebar": [
+				{
+					"id": "openclaude-sidebar-secondary",
+					"title": "OpenClaude",
+					"icon": "resources/openclaude-logo.svg",
+					"when": "!openclaude:doesNotSupportSecondarySidebar"
+				}
+			]
+		},
+		"views": {
+			"openclaude-sidebar": [
+				{
+					"type": "webview",
+					"id": "openclaudeSidebar",
+					"name": "OpenClaude",
+					"when": "openclaude:doesNotSupportSecondarySidebar"
+				}
+			],
+			"openclaude-sidebar-secondary": [
+				{
+					"type": "webview",
+					"id": "openclaudeSidebarSecondary",
+					"name": "OpenClaude",
+					"when": "!openclaude:doesNotSupportSecondarySidebar"
+				}
+			],
+			"openclaude-sessions-sidebar": [
+				{
+					"type": "webview",
+					"id": "openclaudeSessionsList",
+					"name": "",
+					"when": "openclaude.sessionsListEnabled"
+				}
+			]
+		},
+		"walkthroughs": [
+			{
+				"id": "openclaude-walkthrough",
+				"title": "Get started with OpenClaude",
+				"description": "Learn how to use OpenClaude to write, edit, and understand your code.",
+				"steps": [
+					{
+						"id": "welcome",
+						"title": "Your AI coding partner",
+						"description": "OpenClaude helps you write, edit, and understand code right in VS Code.",
+						"media": {
+							"markdown": "resources/walkthrough/step1.md"
+						}
+					},
+					{
+						"id": "open-openclaude",
+						"title": "Open OpenClaude",
+						"description": "Click the OpenClaude icon in the top right corner, or press Ctrl+Escape (Cmd+Escape on Mac) to start a conversation.",
+						"media": {
+							"markdown": "resources/walkthrough/step2.md"
+						},
+						"completionEvents": [
+							"onCommand:openclaude.sidebar.open",
+							"onCommand:openclaude.editor.open"
+						]
+					},
+					{
+						"id": "chat",
+						"title": "Chat with OpenClaude",
+						"description": "Type a message and press Enter. Ask questions, request changes, or get help understanding your code. Use @ to mention files for context, or select code first to ask about it.",
+						"media": {
+							"markdown": "resources/walkthrough/step3.md"
+						}
+					},
+					{
+						"id": "sessions",
+						"title": "Past conversations",
+						"description": "Click the Past Conversations button at the top or type /resume to browse past sessions. You can start a new conversation anytime by clicking the New Chat button.",
+						"media": {
+							"markdown": "resources/walkthrough/step4.md"
+						}
+					}
+				]
+			}
+		],
+		"menus": {
+			"editor/title": [
+				{
+					"command": "openclaude.acceptProposedDiff",
+					"when": "openclaude.viewingProposedDiff",
+					"group": "navigation"
+				},
+				{
+					"command": "openclaude.rejectProposedDiff",
+					"when": "openclaude.viewingProposedDiff",
+					"group": "navigation"
+				},
+				{
+					"command": "openclaude.editor.openLast",
+					"when": "!config.openclaudeCode.useTerminal",
+					"group": "navigation"
+				},
+				{
+					"command": "openclaude.terminal.open",
+					"when": "config.openclaudeCode.useTerminal",
+					"group": "navigation"
+				}
+			],
+			"commandPalette": [
+				{
+					"command": "openclaude.update",
+					"when": "openclaude.updateSupported"
+				},
+				{
+					"command": "openclaude.editor.openLast",
+					"when": "false"
+				},
+				{
+					"command": "openclaude.primaryEditor.open",
+					"when": "openclaude.primaryEditorEnabled"
+				},
+				{
+					"command": "openclaude.createWorktree",
+					"when": "openclaude.createWorktreeEnabled"
+				},
+				{
+					"command": "openclaude.blur",
+					"when": "false"
+				},
+				{
+					"command": "openclaude.newConversation",
+					"when": "false"
+				},
+				{
+					"command": "openclaude.insertAtMentioned",
+					"when": "config.openclaudeCode.useTerminal"
+				},
+				{
+					"command": "openclaude.insertAtMention",
+					"when": "!config.openclaudeCode.useTerminal"
+				},
+				{
+					"command": "openclaude.installPlugin",
+					"when": "openclaude.updateSupported"
+				}
+			]
+		}
+	},
+	"capabilities": {
+		"untrustedWorkspaces": {
+			"supported": false,
+			"description": "untusted workspaces are not supported"
+		}
+	},
+	"scripts": {
+		"build": "npm run build:extension && npm run build:webview",
+		"build:extension": "node esbuild.config.mjs",
+		"build:webview": "cd webview && npx vite build",
+		"watch": "node esbuild.config.mjs --watch",
+		"package": "npx @vscode/vsce package --no-dependencies",
+		"lint": "eslint src/ webview/src/",
+		"format": "prettier --write \"src/**/*.ts\" \"webview/src/**/*.{ts,tsx}\""
+	},
+	"dependencies": {},
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"@types/vscode": "^1.94.0",
+		"esbuild": "^0.21.0",
+		"eslint": "^8.57.0",
+		"prettier": "^3.3.0",
+		"typescript": "^5.5.0",
+		"@vscode/vsce": "^3.0.0"
+	}
+}
