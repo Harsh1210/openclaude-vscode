@@ -73,10 +73,11 @@ OpenClaude is a fork of Claude Code that adds an OpenAI-compatible shim (786 lin
 openclaude \
   --output-format stream-json \
   --input-format stream-json \
-  --ide \
   --model <from settings> \
   --permission-mode <from settings>
 ```
+
+> **Note:** `--ide` is NOT required for the structured protocol. It only means "auto-connect to IDE if one is available." The structured JSON protocol is activated by `--output-format stream-json --input-format stream-json`.
 
 **Contextual flags:**
 - `--resume <uuid>` — resuming a session
@@ -93,54 +94,212 @@ openclaude \
 
 ### 2.3 NDJSON Message Protocol
 
-**Messages FROM CLI (stdout):**
+> **Source of truth:** `src/entrypoints/sdk/controlSchemas.ts` and `src/entrypoints/sdk/coreSchemas.ts` in the OpenClaude CLI repo.
 
-| Message Type | When | Key Fields |
+Each line on stdin/stdout is a JSON object followed by `\n`. Unicode line terminators (U+2028, U+2029) are escaped.
+
+#### 2.3.1 Initialize Handshake (REQUIRED — must happen first)
+
+After spawning the CLI, the extension MUST send an `initialize` control_request before any user messages:
+
+```json
+{
+  "type": "control_request",
+  "request_id": "init-001",
+  "request": {
+    "subtype": "initialize",
+    "hooks": {},
+    "sdkMcpServers": [],
+    "promptSuggestions": true,
+    "agentProgressSummaries": true
+  }
+}
+```
+
+The CLI responds with:
+
+```json
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "init-001",
+    "response": {
+      "commands": [...],       // All available slash commands
+      "agents": [...],         // Available agents
+      "output_style": "...",   // Current output style
+      "available_output_styles": [...],
+      "models": [...],         // Available models
+      "account": {...},        // Auth/account info
+      "pid": 12345,            // CLI process PID
+      "fast_mode_state": {...} // Fast mode status
+    }
+  }
+}
+```
+
+This response populates the slash command menu, model picker, and account status.
+
+#### 2.3.2 Stdout Messages (CLI → Extension)
+
+The `StdoutMessageSchema` is a union of these top-level types:
+
+**Core Message Types:**
+
+| Type | Description | Key Fields |
 |---|---|---|
-| `message_start` | New assistant turn begins | `message.id`, `message.model` |
-| `content_block_start` | Text or tool block begins | `index`, `content_block.type` |
-| `content_block_delta` | Streaming text chunk | `index`, `delta.text` |
-| `content_block_stop` | Block finished | `index` |
-| `message_delta` | Message metadata update | `delta.stop_reason`, `usage` |
-| `message_stop` | Full turn complete | — |
-| `control_request` | Permission needed | `request_id`, `tool_name`, `tool_input` |
-| `elicitation` | Claude asks user a structured question | `request_id`, `question`, `options` |
-| `ai-title` | Auto-generated session title | `sessionId`, `aiTitle` |
-| `custom-title` | User-set session title | `sessionId`, `customTitle` |
-| `summary` | Context compaction happened | `leafUuid`, `summary` |
-| `teleported-from` | Session transferred from another device | `remoteSessionId`, `branch`, `messageCount` |
-| `teleport-skipped-branch` | Teleport branch was skipped | `branch` |
-| `file-history-snapshot` | File state checkpoint | `files`, `uuid` |
-| `attribution-snapshot` | Attribution metadata | `attribution` |
-| `progress` | Long-running task progress | `message`, `percentage` |
+| `assistant` | Complete assistant turn | `message`, `uuid`, `session_id` |
+| `user` | Echoed/replayed user message | `message`, `uuid`, `session_id` |
+| `result` | Turn completion (success or error) | `subtype` (success/error_*), `duration_ms`, `total_cost_usd`, `usage`, `modelUsage`, `num_turns`, `stop_reason`, `permission_denials`, `fast_mode_state` |
+| `stream_event` | Wrapper for Anthropic streaming events | `event` (contains content_block_start/delta/stop, message_start/delta/stop) |
+| `tool_progress` | Long-running tool progress | tool-specific progress data |
+| `tool_use_summary` | Summary of tool invocation | tool name, input summary |
+| `auth_status` | Auth state change | authentication details |
+| `rate_limit_event` | Rate limit warning | limit info |
+| `prompt_suggestion` | AI-generated next prompt suggestions | suggestion text |
 
-**Content Block Types (within content_block_start/delta):**
+**System Messages** (type: `system`, differentiated by `subtype`):
 
-| Block Type | Description |
+| Subtype | Description |
 |---|---|
-| `text` | Standard text response |
-| `tool_use` | Tool invocation |
-| `tool_result` | Tool output |
-| `thinking` | Extended thinking (visible reasoning) |
-| `redacted_thinking` | Redacted thinking block (hidden reasoning) |
-| `image` | Inline image in response |
-| `document` | PDF/document content |
-| `search_result` | Search result display |
-| `web_search_tool_result` | Web search output |
-| `server_tool_use` | Server-side tool invocation |
+| `init` | Session initialization info |
+| `status` | General status update |
+| `compact_boundary` | Context compaction occurred |
+| `api_retry` | API call being retried |
+| `local_command_output` | Output from local command |
+| `hook_started` | Hook execution started |
+| `hook_progress` | Hook execution progress |
+| `hook_response` | Hook execution result |
+| `session_state_changed` | Session state transition |
+| `files_persisted` | Files saved to disk |
+| `task_notification` | Background task notification |
+| `task_started` | Background task started |
+| `task_progress` | Background task progress |
+| `elicitation_complete` | Elicitation flow completed |
 
-**Messages TO CLI (stdin):**
+**Control Messages:**
 
-| Message Type | When | Key Fields |
+| Type | Description |
+|---|---|
+| `control_request` | CLI asking extension for input (permission, elicitation, hook callback, MCP message) |
+| `control_response` | CLI responding to extension's request (initialize, mcp_status, get_context_usage, etc.) |
+| `control_cancel_request` | CLI canceling a pending control request (e.g., hook resolved permission) |
+| `keep_alive` | Connection health ping |
+
+**Streaming Events** (nested inside `stream_event.event`):
+
+The `stream_event` wraps Anthropic-format streaming events:
+```json
+{
+  "type": "stream_event",
+  "event": { "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "..." } },
+  "parent_tool_use_id": null,
+  "uuid": "...",
+  "session_id": "..."
+}
+```
+
+Content block types within streaming events:
+- `text` — Standard text response
+- `tool_use` — Tool invocation
+- `tool_result` — Tool output
+- `thinking` — Extended thinking (visible reasoning)
+- `redacted_thinking` — Redacted thinking (hidden)
+- `image` — Inline image
+- `document` — PDF/document content
+- `search_result` — Search result
+- `web_search_tool_result` — Web search output
+- `server_tool_use` — Server-side tool invocation
+
+#### 2.3.3 Stdin Messages (Extension → CLI)
+
+The `StdinMessageSchema` accepts these types:
+
+**User Message:**
+```json
+{
+  "type": "user",
+  "message": { "role": "user", "content": "fix the bug in auth.ts" },
+  "parent_tool_use_id": null,
+  "uuid": "msg-001",
+  "session_id": "session-uuid"
+}
+```
+
+**Control Requests (Extension → CLI):**
+
+The extension actively sends control requests to manage the session:
+
+| Subtype | Purpose | Key Fields |
 |---|---|---|
-| `user-message` | User sends prompt | `content`, `attachments` |
-| `control_response` | Answering permission request | `request_id`, `response` (allow/deny) |
+| `initialize` | Start session handshake | `hooks`, `sdkMcpServers`, `promptSuggestions` |
+| `interrupt` | Stop/cancel current generation | — |
+| `set_permission_mode` | Switch permission mode | `mode` (default/plan/acceptEdits/bypassPermissions/dontAsk) |
+| `set_model` | Switch model | `model` |
+| `set_max_thinking_tokens` | Configure thinking depth | `max_thinking_tokens` |
+| `mcp_status` | Query MCP server status | — |
+| `get_context_usage` | Get context window usage (for ContextFooter) | — |
+| `rewind_files` | Checkpoint/rewind to previous state | `user_message_id`, `dry_run` |
+| `mcp_set_servers` | Configure MCP servers | `servers` |
+| `mcp_reconnect` | Reconnect MCP server | `serverName` |
+| `mcp_toggle` | Enable/disable MCP server | `serverName`, `enabled` |
+| `reload_plugins` | Reload plugin system | — |
+| `apply_flag_settings` | Update runtime settings | `settings` |
+| `get_settings` | Query current settings | — |
+| `stop_task` | Cancel background task | `task_id` |
+| `cancel_async_message` | Cancel async message | `message_uuid` |
+| `seed_read_state` | Seed file read state | `path`, `mtime` |
 
-**Error handling:**
+**Control Responses (Extension → CLI):**
+
+When the CLI sends a `control_request`, the extension responds:
+
+```json
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "req-001",
+    "response": { ... }
+  }
+}
+```
+
+Or error:
+```json
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "error",
+    "request_id": "req-001",
+    "error": "User denied permission"
+  }
+}
+```
+
+**Other Stdin Types:**
+- `keep_alive` — Connection health pong
+- `update_environment_variables` — Update env vars at runtime (`variables` record)
+
+#### 2.3.4 Control Request Subtypes FROM CLI
+
+The CLI sends these `control_request` subtypes that the extension must handle:
+
+| Subtype | Description | Extension Action |
+|---|---|---|
+| `can_use_tool` | Permission request | Show PermissionDialog, respond allow/deny |
+| `elicitation` | Structured user question (from MCP) | Show ElicitationDialog, return user response |
+| `hook_callback` | Hook execution callback | Execute hook, return result |
+| `mcp_message` | MCP JSON-RPC forwarding | Forward to IDE MCP server |
+
+#### 2.3.5 Error Handling
+
 - Exit code 0 → normal exit
 - Exit code non-0 → crash → auto-restart with `--resume`
 - stderr → debug logs (captured when `--debug` flag set)
 - Stdin closed → CLI terminates gracefully
+- `control_cancel_request` → cancel stale permission/elicitation dialogs
+- `keep_alive` → send periodically to maintain connection health
 
 ---
 
@@ -310,7 +469,7 @@ Rebranded from `claude-vscode.*` to `openclaude.*`:
 | `openclaudeCode.allowDangerouslySkipPermissions` | boolean | `false` | Allow bypass mode |
 | `openclaudeCode.openclaudeProcessWrapper` | string | — | Custom process wrapper |
 | `openclaudeCode.respectGitIgnore` | boolean | `true` | Respect .gitignore |
-| `openclaudeCode.initialPermissionMode` | enum | `"default"` | default/acceptEdits/plan/bypassPermissions |
+| `openclaudeCode.initialPermissionMode` | enum | `"default"` | default/acceptEdits/plan/bypassPermissions/dontAsk |
 | `openclaudeCode.disableLoginPrompt` | boolean | `false` | Skip auth prompts |
 | `openclaudeCode.autosave` | boolean | `true` | Auto-save before read/write |
 | `openclaudeCode.useCtrlEnterToSend` | boolean | `false` | Ctrl+Enter to send |
@@ -361,7 +520,7 @@ The schema covers ALL CLI settings (70+ properties). Key categories:
 `respectGitignore`, `cleanupPeriodDays`, `fileSuggestion` (command type), `claudeMdExcludes`
 
 **Hooks:**
-`hooks` (24 events: PreToolUse, PostToolUse, Notification, SessionStart, SessionEnd, SubagentStart, SubagentStop, TeammateIdle, TaskCreated, TaskCompleted, Elicitation, ElicitationResult, ConfigChange, WorktreeCreate, etc.), `disableAllHooks`, `allowManagedHooksOnly`, `allowedHttpHookUrls`, `httpHookAllowedEnvVars`
+`hooks` (27 events: PreToolUse, PostToolUse, PostToolUseFailure, Notification, UserPromptSubmit, SessionStart, SessionEnd, Stop, StopFailure, SubagentStart, SubagentStop, PreCompact, PostCompact, PermissionRequest, PermissionDenied, Setup, TeammateIdle, TaskCreated, TaskCompleted, Elicitation, ElicitationResult, ConfigChange, WorktreeCreate, WorktreeRemove, InstructionsLoaded, CwdChanged, FileChanged), `disableAllHooks`, `allowManagedHooksOnly`, `allowedHttpHookUrls`, `httpHookAllowedEnvVars`
 
 **Git & Attribution:**
 `attribution` (commit, PR), `includeGitInstructions`
@@ -647,28 +806,38 @@ Each story is scoped to be completable in **one session** (~2-4 hours of focused
 
 ---
 
-### Story 2: Process Manager & NDJSON Transport
-**Points:** 5 | **Priority:** P0 | **Dependency:** Story 1
+### Story 2: Process Manager, NDJSON Transport & Initialize Handshake
+**Points:** 8 | **Priority:** P0 | **Dependency:** Story 1
 
 **Acceptance Criteria:**
-- [ ] ProcessManager spawns `openclaude` CLI with `--output-format stream-json --input-format stream-json --ide`
+- [ ] ProcessManager spawns `openclaude` CLI with `--output-format stream-json --input-format stream-json`
 - [ ] Resolves `openclaude` binary from PATH or npm global
 - [ ] Passes environment variables from settings (provider keys, model, etc.)
-- [ ] NdjsonTransport parses line-delimited JSON from stdout
+- [ ] NdjsonTransport parses line-delimited JSON from stdout (handles partial lines, unicode escapes)
 - [ ] NdjsonTransport writes JSON + newline to stdin
+- [ ] **Initialize handshake**: sends `control_request` with `subtype: initialize` immediately after spawn
+- [ ] Parses initialize response to populate: available commands, models, agents, account info, fast mode state
+- [ ] **Full type system**: TypeScript types for ALL StdoutMessage and StdinMessage variants (see Section 2.3)
+- [ ] **Control request router**: routes incoming `control_request` (can_use_tool, elicitation, hook_callback, mcp_message) to appropriate handlers
+- [ ] **Control response sender**: sends `control_response` (success/error) back to CLI with matching `request_id`
+- [ ] **Control cancel handler**: handles `control_cancel_request` to dismiss stale dialogs
+- [ ] **Keep-alive**: periodic `keep_alive` messages to maintain connection
 - [ ] Handles CLI crash → auto-restart with `--resume`
 - [ ] Handles CLI exit code 0 → clean shutdown
 - [ ] stderr captured for debug logging
-- [ ] EventEmitter pattern: `onMessage`, `onError`, `onExit`
-- [ ] Unit tests for NDJSON parsing (edge cases: partial lines, unicode, empty lines)
+- [ ] EventEmitter pattern: `onMessage`, `onError`, `onExit`, `onControlRequest`
+- [ ] Unit tests for NDJSON parsing and initialize handshake
 
 **Files to create:**
 - `src/process/processManager.ts`
 - `src/process/ndjsonTransport.ts`
-- `src/types/messages.ts` (all NDJSON message types)
-- `src/types/protocol.ts`
+- `src/process/controlRouter.ts` (routes control_request subtypes)
+- `src/types/messages.ts` (ALL SDK message types from controlSchemas.ts)
+- `src/types/protocol.ts` (control request/response types)
+- `src/types/session.ts` (SDKSessionInfo, result types)
 - `test/unit/ndjsonTransport.test.ts`
 - `test/unit/processManager.test.ts`
+- `test/unit/controlRouter.test.ts`
 
 ---
 
@@ -856,13 +1025,14 @@ Each story is scoped to be completable in **one session** (~2-4 hours of focused
 **Points:** 5 | **Priority:** P1 | **Dependency:** Story 4
 
 **Acceptance Criteria:**
-- [ ] CheckpointManager snapshots file state after each assistant turn with file edits
+- [ ] CheckpointManager tracks message UUIDs for rewind targets
 - [ ] Hover on any assistant message shows rewind button
 - [ ] Three options: Fork conversation (new branch, keep code), Rewind code (revert files, keep conversation), Fork + Rewind (both)
 - [ ] Fork: spawns new CLI with `--fork-session` from that message's UUID
-- [ ] Rewind: restores file contents from snapshot, continues same session
+- [ ] **Rewind: sends `control_request` with `subtype: rewind_files` and `user_message_id`** (CLI handles file restoration server-side)
+- [ ] Supports `dry_run` mode to preview what files will be reverted
 - [ ] CheckpointMarker component renders hover UI
-- [ ] File snapshots stored in memory (not disk)
+- [ ] Handles `SDKFilesPersistedEvent` and `session_state_changed` system messages
 
 **Files to create:**
 - `src/checkpoint/checkpointManager.ts`
@@ -1081,7 +1251,7 @@ Each story is scoped to be completable in **one session** (~2-4 hours of focused
 | Story | Title | Points | Priority | Dependency |
 |---|---|---|---|---|
 | 1 | Project Scaffolding & Extension Shell | 3 | P0 | — |
-| 2 | Process Manager & NDJSON Transport | 5 | P0 | Story 1 |
+| 2 | Process Manager, NDJSON Transport & Initialize Handshake | 8 | P0 | Story 1 |
 | 3 | Webview Shell & PostMessage Bridge | 5 | P0 | Story 1 |
 | 4 | Chat UI — Message List & Streaming | 8 | P0 | Stories 2, 3 |
 | 5 | Prompt Input, @-Mentions, Slash Commands & Toolbar | 8 | P0 | Story 4 |
@@ -1100,7 +1270,7 @@ Each story is scoped to be completable in **one session** (~2-4 hours of focused
 | 18 | Settings Schema, Fast Mode & Prompt Suggestions | 3 | P2 | Story 1 |
 | 19 | Plan Review Inline Comment System | 5 | P1 | Story 7 |
 | 20 | Polish, Testing & Marketplace Publish | 5 | P2 | All (1-19) |
-| **Total** | | **96** | | |
+| **Total** | | **99** | | |
 
 ### Dependency Graph
 
