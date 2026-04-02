@@ -19,29 +19,60 @@ A VS Code extension that provides a full-featured AI coding assistant UI by wrap
 
 OpenClaude is a fork of Claude Code that adds an OpenAI-compatible shim (786 lines, 6 files changed), enabling any LLM via the OpenAI Chat Completions API — GPT-4o, Gemini, DeepSeek, Ollama, and 200+ models. It has the same CLI interface, tools, and capabilities as Claude Code.
 
-### 1.1 Reuse Strategy
+### 1.1 Reuse Strategy — Maximize Code Reuse from Claude Code Extension
 
-**Reuse everything from Claude Code's extension. Only write new code where extraction is impractical.**
+**We do NOT rewrite from scratch.** We reuse as much as possible from the Claude Code VS Code extension, only writing new code where the existing code is minified beyond recovery. For every story: first check if the equivalent exists in Claude Code's extension and extract it.
 
-For every story: first deminify and extract the equivalent from Claude Code's `extension.js` (101KB) and `webview/index.js` (198KB), then rebrand and adapt. Build fresh only for React component internals where minified JSX is unreadable.
+**What we fork/copy directly (zero or minimal changes needed):**
 
-**Direct copy + rebrand:**
-- `package.json` — all commands, keybindings, settings, views, menus
-- `claude-code-settings.schema.json` — full 70+ property settings schema
-- `resources/walkthrough/*.md` — onboarding content
-- `resources/*.svg` — icons (rebrand)
-- Plan review HTML (lines 340-690 of extension.js — extractable as-is)
+| Asset | Source | Changes Needed |
+|---|---|---|
+| `package.json` | Claude Code extension | Rebrand names, IDs, icons. All commands, keybindings, settings, views, menus reused as-is. |
+| `claude-code-settings.schema.json` | Claude Code extension (21KB, readable JSON) | Rebrand references from "claude" → "openclaude" |
+| Walkthrough markdown | `resources/walkthrough/*.md` | Rebrand text and screenshots |
+| SVG icons | `resources/*.svg` | Rebrand colors/logo |
+| `.vscode/launch.json`, `tasks.json` | Standard VS Code extension scaffold | Reuse patterns |
 
-**Deminify and extract:**
-- Process spawn logic, NDJSON parser, diff provider, MCP IDE server, postMessage protocol, status bar, command registration — all extractable from extension.js with a formatter
+**What we deminify and extract from extension.js (~101KB, 846 lines):**
 
-**Build fresh (referencing minified code for behavior):**
-- React webview components — the minified JSX is unreadable, but we match the exact layout, classes, and behavior by using the minified code as a visual/behavioral reference
+The extension.js is minified but still readable with a formatter. We extract:
 
-**Reference locations:**
+| Component | Approach |
+|---|---|
+| Process spawn logic | Deminify the `spawn(K,V,{cwd:B,shell:!1})` pattern — ~20 lines. Copy the exact flags, env var setup, and restart logic. |
+| NDJSON line parser | Deminify the buffer/newline parser (`CO6`, `Ld` functions) — ~30 lines. Copy the exact parsing logic. |
+| Diff provider | Deminify the `vscode.diff` setup and TextDocumentContentProvider — ~50 lines. Well-defined VS Code API pattern. |
+| MCP IDE server | Deminify the HTTP server setup and tool registration — ~100 lines. Copy the auth token and lockfile pattern. |
+| postMessage protocol | Deminify the message type switch statements — extract the exact message type enum and routing. |
+| Plan review HTML | Lines 340-690 contain the plan review inline comment system as HTML strings — extractable as-is. |
+| Status bar setup | Deminify the StatusBarItem creation, color indicators, click handler — ~20 lines. |
+| Command registration | Deminify the `registerCommand` calls — extract the exact command wiring. |
+
+**What we extract from the minified webview/index.js (~198KB, 2045 lines):**
+
+| Component | Approach |
+|---|---|
+| CSS/Tailwind classes | Deminify and extract the exact class names and layout structure. Replicate the visual design pixel-for-pixel. |
+| Component structure | Use the minified code as a reference implementation. Build clean React components that match the exact behavior. |
+| Message rendering logic | Extract how each content block type is rendered (thinking, image, document, search, etc.). |
+| Input toolbar layout | Extract the exact button arrangement, icons, and dropdown behavior. |
+| Permission dialog | Extract the dialog layout, button labels, "Always Allow" logic. |
+| Session list | Extract the grouping logic (Today, Yesterday, This Week, etc.), card layout. |
+
+**What we build fresh (minified code is too tangled to extract):**
+
+| Component | Reason |
+|---|---|
+| React component tree | The webview uses a bundled React app — easier to write clean components than untangle minified JSX with single-letter variable names |
+| State management (hooks) | Internal state wiring in minified code uses single-letter variables — not extractable, but behavior is observable |
+| Tailwind config | Start fresh with Tailwind, match the visual output by referencing extracted CSS classes |
+
+**Reference implementation locations:**
 - Claude Code extension: `~/.vscode/extensions/anthropic.claude-code-2.1.85-darwin-arm64/`
 - OpenClaude CLI source: `~/Documents/workspace/openclaude/`
 - SDK protocol schemas: `openclaude/src/entrypoints/sdk/controlSchemas.ts`
+
+> **Rule:** Before writing any module, first deminify and check the equivalent in Claude Code's extension. Only write from scratch if extraction is impractical.
 
 ---
 
