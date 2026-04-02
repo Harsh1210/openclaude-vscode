@@ -2,18 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement the full permission system — handle `can_use_tool` control requests from the CLI, show a PermissionDialog in the webview, collect allow/deny/always-allow responses, send `control_response` back to CLI, display a permission mode indicator in the footer with mode switching, handle auto/bypass/plan modes, and support `control_cancel_request` to dismiss stale dialogs.
+**Goal:** Implement the full permission lifecycle: the extension host receives `can_use_tool` control requests from the CLI, forwards them to the webview as permission dialogs, collects allow/deny/always-allow responses, sends `control_response` back to the CLI, and supports switching between permission modes (default/plan/acceptEdits/bypassPermissions/dontAsk). Also handle `control_cancel_request` for stale dialogs, auto-approve in auto mode, gate bypass mode behind a setting, and render plan documents in a basic PlanViewer.
 
-**Architecture:** The CLI sends `control_request` with `subtype: 'can_use_tool'` to the extension host. The `PermissionHandler` (extension host) receives this via the `ControlRouter` (Story 2), forwards it to the webview via `WebviewBridge` (Story 3) as a `permission_request` postMessage. The webview renders a `PermissionDialog` modal. User clicks Allow/Deny/Always Allow. The response flows back via `permission_response` postMessage to the extension host, which sends a `control_response` NDJSON to the CLI's stdin. Permission mode changes flow in the opposite direction: user clicks the mode indicator in `ContextFooter`, selects a new mode, webview sends `set_permission_mode` postMessage, extension host sends `set_permission_mode` control_request to CLI.
+**Architecture:** The PermissionHandler (extension host) is the single coordinator. It receives `control_request` messages with `subtype: 'can_use_tool'` from the NdjsonTransport, decides whether to auto-approve (based on current permission mode and always-allow rules), and if not, forwards to the webview via postMessage. The webview shows a PermissionDialog modal. User response flows back through postMessage to PermissionHandler, which constructs and sends a `control_response` on stdin. For mode changes, the webview sends `set_permission_mode` to the host, which sends a `control_request` with `subtype: 'set_permission_mode'` to the CLI.
 
 **Tech Stack:** TypeScript 5.x, VS Code Extension API, React 18, Tailwind CSS 3
 
 **Spec:** [2026-04-02-openclaude-vscode-extension-design.md](../specs/2026-04-02-openclaude-vscode-extension-design.md) — Story 7, Sections 2.3.4, 3.4, 4.3
 
-**Dependencies:**
-- Story 2: `ControlRouter` (routes `control_request` by subtype), `NdjsonTransport` (writes `control_response` to CLI stdin)
-- Story 3: `WebviewBridge` (postMessage bridge between extension host and webview)
-- Story 4: Chat UI shell (message list, streaming — provides the webview context where dialogs render)
+**Depends on:** Story 4 (WebviewBridge + postMessage protocol, NdjsonTransport integration)
 
 **Key protocol schemas (source of truth):**
 - `openclaude/src/entrypoints/sdk/controlSchemas.ts` — `SDKControlPermissionRequestSchema`, `SDKControlSetPermissionModeRequestSchema`, `SDKControlCancelRequestSchema`
@@ -25,848 +22,886 @@
 
 | File | Responsibility |
 |---|---|
-| `src/permissions/permissionHandler.ts` | Extension host module — receives `can_use_tool` from CLI, forwards to webview, collects response, sends `control_response` back. Tracks pending requests for cancellation. |
-| `webview/src/components/dialogs/PermissionDialog.tsx` | Webview modal — shows tool name, formatted input, Allow/Deny/Always Allow buttons. |
-| `webview/src/components/dialogs/PlanViewer.tsx` | Webview component — renders plan document from CLI when in plan mode. |
-| `webview/src/components/input/PermissionModeIndicator.tsx` | Webview component — footer badge showing current permission mode with click-to-switch dropdown. |
-| `webview/src/hooks/usePermissions.ts` | React hook — manages permission dialog state, pending requests queue, mode state. |
-| `src/types/messages.ts` | Update — add `permission_suggestions`, `title`, `display_name`, `description`, `blocked_path`, `decision_reason` fields to `PermissionRequestMessage`. |
-| `src/webview/types.ts` | Update — add `permissionMode` to `InitStateMessage`, add `PermissionModeChangedMessage`, expand `PermissionResponseMessage` with `updatedPermissions`. |
+| `src/permissions/permissionHandler.ts` | Extension host coordinator — receives CLI permission requests, manages pending requests map, auto-approves in auto/bypass modes, forwards to webview, sends control_response back to CLI, handles cancel requests |
+| `src/permissions/permissionRules.ts` | In-memory "always allow" rule store — tracks tool-level allow rules added during the session, persists to VS Code workspace state |
+| `src/permissions/permissionRouter.ts` | Routes incoming control_request/control_cancel_request messages to the PermissionHandler by subtype |
+| `webview/src/components/dialogs/PermissionDialog.tsx` | React modal — shows tool name, formatted input JSON, Allow/Deny/Always Allow buttons, risk-level coloring |
+| `webview/src/components/dialogs/PlanViewer.tsx` | Basic plan document renderer — markdown plan from CLI in plan mode (full inline comment system is Story 19) |
+| `webview/src/components/input/PermissionModeIndicator.tsx` | Footer badge showing current permission mode, clickable to open mode picker |
+| `webview/src/components/input/ModeSelector.tsx` | Dropdown picker for switching permission modes |
+| `webview/src/hooks/usePermissions.ts` | React hook — manages pending permission requests queue, dispatches responses to host |
 
 ---
 
-## Task 1: Extend PostMessage Types for Rich Permission Data
+## Task 1: Permission Rules Store
 
 **Files:**
-- Modify: `src/webview/types.ts`
-- Modify: `src/types/messages.ts` (verify existing types are sufficient)
+- Create: `src/permissions/permissionRules.ts`
 
-The existing `PermissionRequestMessage` is too thin — it only has `toolName`, `toolInput`, `riskLevel`. The CLI sends much richer data: `permission_suggestions`, `title`, `display_name`, `description`, `blocked_path`, `decision_reason`, `tool_use_id`, `agent_id`. We need to pass all of this through to the webview.
+A simple store that tracks "always allow" rules for the current session. Rules persist to VS Code workspace state so they survive extension restarts within the same workspace.
 
-Similarly, the `PermissionResponseMessage` going back needs to carry `updatedPermissions` for "Always Allow" and `decisionClassification` for telemetry.
-
-- [ ] **Step 1: Update PermissionRequestMessage in src/webview/types.ts**
-
-Replace the existing `PermissionRequestMessage` with the full fields:
+- [ ] **Step 1: Create the PermissionRules store**
 
 ```typescript
-/** Permission request from CLI -> show dialog in webview */
-export interface PermissionRequestMessage {
-  type: 'permission_request';
-  requestId: string;
-  toolName: string;
-  displayName?: string;
-  toolInput: Record<string, unknown>;
-  title?: string;
-  description?: string;
-  decisionReason?: string;
-  blockedPath?: string;
-  permissionSuggestions?: PermissionSuggestion[];
-  toolUseId: string;
-  agentId?: string;
-}
+// src/permissions/permissionRules.ts
+import * as vscode from 'vscode';
 
-/** A suggested permission rule that "Always Allow" can apply */
-export interface PermissionSuggestion {
-  type: 'addRules' | 'replaceRules' | 'removeRules';
-  rules: Array<{ toolName: string; ruleContent?: string }>;
-  behavior: 'allow' | 'deny' | 'ask';
-  destination: 'userSettings' | 'projectSettings' | 'localSettings' | 'session' | 'cliArg';
+const STORAGE_KEY = 'openclaude.permissionRules.alwaysAllow';
+
+/**
+ * Manages session-scoped "always allow" permission rules.
+ *
+ * Rules are stored in VS Code workspace state (survives extension restart
+ * but scoped to the workspace). They can also be promoted to project-level
+ * settings via the CLI's permission_suggestions mechanism.
+ */
+export class PermissionRules {
+  private readonly rules = new Set<string>();
+
+  constructor(private readonly context: vscode.ExtensionContext) {
+    // Restore from workspace state
+    const stored = context.workspaceState.get<string[]>(STORAGE_KEY, []);
+    for (const rule of stored) {
+      this.rules.add(rule);
+    }
+  }
+
+  /**
+   * Check if a tool has an "always allow" rule.
+   */
+  has(toolName: string): boolean {
+    return this.rules.has(toolName);
+  }
+
+  /**
+   * Add an "always allow" rule for a tool.
+   */
+  add(toolName: string): void {
+    this.rules.add(toolName);
+    this.persist();
+  }
+
+  /**
+   * Remove an "always allow" rule.
+   */
+  remove(toolName: string): void {
+    this.rules.delete(toolName);
+    this.persist();
+  }
+
+  /**
+   * Get all current rules.
+   */
+  getAll(): string[] {
+    return Array.from(this.rules);
+  }
+
+  /**
+   * Clear all session rules.
+   */
+  clear(): void {
+    this.rules.clear();
+    this.persist();
+  }
+
+  private persist(): void {
+    this.context.workspaceState.update(STORAGE_KEY, Array.from(this.rules));
+  }
 }
 ```
 
-- [ ] **Step 2: Update PermissionResponseMessage in src/webview/types.ts**
-
-Replace the existing `PermissionResponseMessage`:
-
-```typescript
-/** User responds to a permission request */
-export interface PermissionResponseMessage {
-  type: 'permission_response';
-  requestId: string;
-  behavior: 'allow' | 'deny';
-  updatedPermissions?: PermissionSuggestion[];
-  decisionClassification?: 'user_temporary' | 'user_permanent' | 'user_reject';
-}
-```
-
-- [ ] **Step 3: Add PermissionModeChangedMessage (host -> webview)**
-
-Add to the host-to-webview messages section:
-
-```typescript
-/** Permission mode changed (from CLI status update or user action) */
-export interface PermissionModeChangedMessage {
-  type: 'permission_mode_changed';
-  mode: 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions' | 'dontAsk';
-}
-```
-
-Add it to the `HostToWebviewMessage` union.
-
-- [ ] **Step 4: Add permissionMode to InitStateMessage**
-
-Add to the existing `InitStateMessage`:
-
-```typescript
-export interface InitStateMessage {
-  type: 'init_state';
-  isSidebar: boolean;
-  isFullEditor: boolean;
-  isSessionListOnly: boolean;
-  theme: 'dark' | 'light' | 'high-contrast';
-  initialSessionId?: string;
-  initialPrompt?: string;
-  extensionVersion: string;
-  permissionMode?: 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions' | 'dontAsk';
-}
-```
-
-- [ ] **Step 5: Verify TypeScript compiles**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit`
-
-Expected: No type errors
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 2: Commit**
 
 ```bash
-git add src/webview/types.ts
-git commit -m "feat(permissions): extend PostMessage types with rich permission data"
+git add src/permissions/permissionRules.ts
+git commit -m "feat(permissions): add PermissionRules store with workspace state persistence"
 ```
 
 ---
 
-## Task 2: PermissionHandler (Extension Host)
+## Task 2: Permission Handler (Extension Host)
 
 **Files:**
 - Create: `src/permissions/permissionHandler.ts`
 
-This is the core orchestrator. It:
-1. Registers as a handler for `can_use_tool` control_request subtypes on the ControlRouter
-2. When a `can_use_tool` arrives, checks the current permission mode — if auto, immediately responds with allow
-3. Otherwise, forwards to all active webview bridges as a `permission_request` postMessage
-4. Listens for `permission_response` from webview bridges
-5. Constructs the correct `control_response` NDJSON and writes it to CLI stdin
-6. Handles `control_cancel_request` by dismissing pending dialogs
-7. Handles `set_permission_mode` webview messages by sending to CLI
+This is the central coordinator on the extension host side. It sits between the NdjsonTransport (CLI messages) and the WebviewBridge (webview messages).
 
-- [ ] **Step 1: Create src/permissions/permissionHandler.ts**
+- [ ] **Step 1: Create the PermissionHandler class**
 
 ```typescript
+// src/permissions/permissionHandler.ts
 import * as vscode from 'vscode';
 import type { WebviewBridge } from '../webview/webviewBridge';
 import type {
-  PermissionRequestMessage,
-  PermissionResponseMessage,
-  PermissionModeChangedMessage,
-  PermissionSuggestion,
-  SetPermissionModeMessage,
-  CancelRequestMessage,
-} from '../webview/types';
-import type {
   ControlRequestPermission,
-  SDKControlRequest,
-  SDKControlCancelRequest,
-  SDKControlResponse,
-  SDKControlRequest as StdinControlRequest,
+  ControlRequestSetPermissionMode,
 } from '../types/messages';
-import type { PermissionMode, PermissionResult, PermissionUpdate } from '../types/session';
+import type {
+  PermissionMode,
+  PermissionUpdate,
+  PermissionDecisionClassification,
+} from '../types/session';
+import { PermissionRules } from './permissionRules';
 
+/** Tracks a pending permission request awaiting user response */
 interface PendingPermissionRequest {
   requestId: string;
-  request: ControlRequestPermission;
+  toolName: string;
+  toolUseId: string;
+  input: Record<string, unknown>;
+  permissionSuggestions?: PermissionUpdate[];
+  displayName?: string;
+  title?: string;
+  description?: string;
+  decisionReason?: string;
+  blockedPath?: string;
+  agentId?: string;
   timestamp: number;
 }
 
 /**
- * PermissionHandler — orchestrates the permission flow between CLI and webview.
+ * PermissionHandler — coordinates the full permission lifecycle.
  *
  * Flow:
- *   CLI stdout -> control_request(can_use_tool) -> PermissionHandler
- *     -> postMessage(permission_request) -> Webview PermissionDialog
- *     -> postMessage(permission_response) -> PermissionHandler
- *     -> CLI stdin <- control_response(allow/deny)
+ * 1. CLI sends control_request { subtype: 'can_use_tool', ... }
+ * 2. PermissionHandler checks current mode + always-allow rules:
+ *    - bypassPermissions/dontAsk -> auto-allow, send control_response immediately
+ *    - acceptEdits + file edit tool -> auto-allow
+ *    - always-allow rule matches -> auto-allow
+ *    - otherwise -> forward to webview as permission_request
+ * 3. Webview shows PermissionDialog, user clicks Allow/Deny/Always Allow
+ * 4. Webview sends permission_response postMessage back
+ * 5. PermissionHandler constructs control_response and writes to CLI stdin
+ * 6. CLI receives response and proceeds
  *
- * Pattern extracted from Claude Code extension.js permission handling.
+ * Also handles:
+ * - control_cancel_request -> dismiss stale dialogs in webview
+ * - set_permission_mode from CLI -> update local mode, notify webview
+ * - set_permission_mode from webview -> send control_request to CLI
  */
 export class PermissionHandler implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly pendingRequests = new Map<string, PendingPermissionRequest>();
-  private readonly bridges: Set<WebviewBridge> = new Set();
+  private readonly rules: PermissionRules;
   private currentMode: PermissionMode = 'default';
+  private bridge: WebviewBridge | null = null;
 
-  /** Callback to write a message to CLI stdin (injected by ProcessManager) */
+  /** Callback to write a JSON message to CLI stdin */
   private writeToStdin: ((message: unknown) => void) | null = null;
 
-  constructor() {}
+  constructor(private readonly context: vscode.ExtensionContext) {
+    this.rules = new PermissionRules(context);
+  }
 
   /**
-   * Set the function used to write NDJSON to the CLI's stdin.
-   * Called by ProcessManager after spawn.
+   * Connect this handler to a WebviewBridge instance.
+   * Registers message handlers for permission_response and set_permission_mode.
+   */
+  connectBridge(bridge: WebviewBridge): void {
+    // Disconnect previous bridge if any
+    this.bridge = bridge;
+
+    // Listen for permission responses from webview
+    this.disposables.push(
+      bridge.onMessage('permission_response', (msg) => {
+        this.handleWebviewPermissionResponse(
+          msg.requestId,
+          msg.allowed,
+          msg.alwaysAllow,
+        );
+      }),
+    );
+
+    // Listen for permission mode changes from webview
+    this.disposables.push(
+      bridge.onMessage('set_permission_mode', (msg) => {
+        this.handleWebviewModeChange(msg.mode as PermissionMode);
+      }),
+    );
+  }
+
+  /**
+   * Set the stdin writer function (provided by ProcessManager/NdjsonTransport).
    */
   setStdinWriter(writer: (message: unknown) => void): void {
     this.writeToStdin = writer;
   }
 
   /**
-   * Clear the stdin writer (called when CLI process exits).
+   * Get the current permission mode.
+   * Called by ProcessManager to pass --permission-mode flag to CLI on spawn.
    */
-  clearStdinWriter(): void {
-    this.writeToStdin = null;
-    // Reject all pending requests since the CLI is gone
-    this.rejectAllPending('CLI process exited');
+  getMode(): PermissionMode {
+    return this.currentMode;
   }
 
   /**
-   * Register a webview bridge to receive permission dialogs and send responses.
-   * Returns a Disposable that unregisters the bridge.
+   * Set the permission mode programmatically (called during initialization
+   * from CLI init response or from system init message).
    */
-  registerBridge(bridge: WebviewBridge): vscode.Disposable {
-    this.bridges.add(bridge);
-
-    // Listen for permission responses from this bridge
-    const responseSub = bridge.onMessage('permission_response', (msg) => {
-      this.handlePermissionResponse(msg as PermissionResponseMessage);
-    });
-
-    // Listen for permission mode change requests from this bridge
-    const modeSub = bridge.onMessage('set_permission_mode', (msg) => {
-      this.handleSetPermissionMode(msg as SetPermissionModeMessage);
-    });
-
-    this.disposables.push(responseSub, modeSub);
-
-    return {
-      dispose: () => {
-        this.bridges.delete(bridge);
-        responseSub.dispose();
-        modeSub.dispose();
-      },
-    };
+  setMode(mode: PermissionMode): void {
+    this.currentMode = mode;
+    this.notifyWebviewModeChange(mode);
   }
 
   /**
    * Handle a can_use_tool control_request from the CLI.
-   * Called by the ControlRouter when it receives this subtype.
+   * This is the main entry point — called by PermissionRouter when it
+   * receives a control_request with subtype 'can_use_tool'.
    */
-  handlePermissionRequest(controlRequest: SDKControlRequest): void {
-    const request = controlRequest.request as ControlRequestPermission;
-    const requestId = controlRequest.request_id;
-
-    // In auto mode (bypassPermissions), immediately allow without showing dialog
-    if (this.currentMode === 'bypassPermissions') {
-      this.sendPermissionResponse(requestId, {
-        behavior: 'allow',
-        toolUseID: request.tool_use_id,
-        decisionClassification: 'user_temporary',
-      });
-      return;
-    }
-
-    // In dontAsk mode, deny if not pre-approved (CLI handles pre-approved rules)
-    // If it reaches us, it means CLI couldn't auto-approve, so we deny.
-    if (this.currentMode === 'dontAsk') {
-      this.sendPermissionResponse(requestId, {
-        behavior: 'deny',
-        message: 'Permission denied: dontAsk mode is active',
-        toolUseID: request.tool_use_id,
-        decisionClassification: 'user_reject',
-      });
-      return;
-    }
-
-    // Store pending request
-    this.pendingRequests.set(requestId, {
-      requestId,
-      request,
-      timestamp: Date.now(),
-    });
-
-    // Convert permission_suggestions to the webview format
-    const permissionSuggestions: PermissionSuggestion[] | undefined =
-      request.permission_suggestions?.map((s) => {
-        if (s.type === 'addRules' || s.type === 'replaceRules' || s.type === 'removeRules') {
-          return {
-            type: s.type,
-            rules: s.rules,
-            behavior: s.behavior,
-            destination: s.destination,
-          } as PermissionSuggestion;
-        }
-        // setMode, addDirectories, removeDirectories are not permission suggestions
-        // for the dialog — filter them out
-        return null;
-      }).filter((s): s is PermissionSuggestion => s !== null);
-
-    // Forward to all active webview bridges
-    const msg: PermissionRequestMessage = {
-      type: 'permission_request',
+  handlePermissionRequest(requestId: string, request: ControlRequestPermission): void {
+    const pending: PendingPermissionRequest = {
       requestId,
       toolName: request.tool_name,
+      toolUseId: request.tool_use_id,
+      input: request.input,
+      permissionSuggestions: request.permission_suggestions,
       displayName: request.display_name,
+      title: request.title,
+      description: request.description,
+      decisionReason: request.decision_reason,
+      blockedPath: request.blocked_path,
+      agentId: request.agent_id,
+      timestamp: Date.now(),
+    };
+
+    // Check if auto-approve applies
+    if (this.shouldAutoApprove(request.tool_name)) {
+      const classification: PermissionDecisionClassification =
+        this.rules.has(request.tool_name) ? 'user_permanent' : 'user_temporary';
+      this.sendAllowResponse(requestId, request.tool_use_id, classification);
+      return;
+    }
+
+    // Store as pending
+    this.pendingRequests.set(requestId, pending);
+
+    // Forward to webview
+    this.bridge?.postMessage({
+      type: 'permission_request',
+      requestId,
+      toolName: request.display_name || request.tool_name,
       toolInput: request.input,
       title: request.title,
       description: request.description,
       decisionReason: request.decision_reason,
       blockedPath: request.blocked_path,
-      permissionSuggestions: permissionSuggestions?.length ? permissionSuggestions : undefined,
-      toolUseId: request.tool_use_id,
+      permissionSuggestions: request.permission_suggestions,
       agentId: request.agent_id,
-    };
-
-    for (const bridge of this.bridges) {
-      bridge.postMessage(msg);
-    }
+    });
   }
 
   /**
    * Handle a control_cancel_request from the CLI.
-   * Dismisses the corresponding permission dialog in the webview.
+   * Dismisses the stale permission dialog in the webview.
    */
-  handleCancelRequest(cancelRequest: SDKControlCancelRequest): void {
-    const requestId = cancelRequest.request_id;
+  handleCancelRequest(requestId: string): void {
+    this.pendingRequests.delete(requestId);
 
-    if (this.pendingRequests.has(requestId)) {
-      this.pendingRequests.delete(requestId);
+    // Tell webview to dismiss the dialog
+    this.bridge?.postMessage({
+      type: 'cancel_request',
+      requestId,
+    });
+  }
 
-      // Tell all bridges to dismiss the dialog
-      const cancelMsg: CancelRequestMessage = {
-        type: 'cancel_request',
-        requestId,
-      };
+  /**
+   * Handle a set_permission_mode control_request FROM the CLI.
+   * The CLI can push mode changes (e.g., entering plan mode via /plan).
+   */
+  handleCliModeChange(request: ControlRequestSetPermissionMode, requestId: string): void {
+    this.currentMode = request.mode;
 
-      for (const bridge of this.bridges) {
-        bridge.postMessage(cancelMsg);
+    // Acknowledge the mode change back to CLI
+    this.sendControlResponse(requestId, {});
+
+    // Notify webview
+    this.notifyWebviewModeChange(request.mode);
+  }
+
+  /**
+   * Check whether a tool should be auto-approved based on current mode and rules.
+   */
+  private shouldAutoApprove(toolName: string): boolean {
+    // Bypass mode: approve everything
+    if (this.currentMode === 'bypassPermissions') {
+      return true;
+    }
+
+    // dontAsk mode: the CLI handles deny logic — if we receive a can_use_tool
+    // in dontAsk mode, the CLI is asking because it needs explicit user permission.
+    // So we do NOT auto-approve in dontAsk. The CLI only sends permission requests
+    // for tools that aren't pre-approved.
+
+    // acceptEdits mode: auto-approve file edit tools
+    if (this.currentMode === 'acceptEdits') {
+      const editTools = [
+        'Write',
+        'Edit',
+        'MultiEdit',
+        'FileEditTool',
+        'FileWriteTool',
+        'NotebookEditTool',
+      ];
+      if (editTools.some((t) => toolName.includes(t))) {
+        return true;
       }
     }
-  }
 
-  /**
-   * Update the current permission mode.
-   * Called when CLI sends a status message with permissionMode, or on init.
-   */
-  setPermissionMode(mode: PermissionMode): void {
-    this.currentMode = mode;
-
-    // Notify all bridges of the mode change
-    const msg: PermissionModeChangedMessage = {
-      type: 'permission_mode_changed',
-      mode,
-    };
-
-    for (const bridge of this.bridges) {
-      bridge.postMessage(msg);
+    // Session-scoped "always allow" rules
+    if (this.rules.has(toolName)) {
+      return true;
     }
+
+    return false;
   }
 
   /**
-   * Get the current permission mode.
+   * Handle the webview user's response to a permission dialog.
    */
-  getPermissionMode(): PermissionMode {
-    return this.currentMode;
-  }
-
-  /**
-   * Handle a permission_response from the webview.
-   */
-  private handlePermissionResponse(msg: PermissionResponseMessage): void {
-    const pending = this.pendingRequests.get(msg.requestId);
+  private handleWebviewPermissionResponse(
+    requestId: string,
+    allowed: boolean,
+    alwaysAllow?: boolean,
+  ): void {
+    const pending = this.pendingRequests.get(requestId);
     if (!pending) {
-      console.warn(`PermissionHandler: No pending request for ID ${msg.requestId}`);
+      console.warn(`Permission response for unknown request: ${requestId}`);
       return;
     }
 
-    this.pendingRequests.delete(msg.requestId);
+    this.pendingRequests.delete(requestId);
 
-    // Build the PermissionResult for the CLI
-    if (msg.behavior === 'allow') {
-      const result: PermissionResult = {
-        behavior: 'allow',
-        toolUseID: pending.request.tool_use_id,
-        decisionClassification: msg.decisionClassification ?? 'user_temporary',
-      };
-
-      // If "Always Allow" was clicked, include the permission updates
-      if (msg.updatedPermissions && msg.updatedPermissions.length > 0) {
-        result.updatedPermissions = msg.updatedPermissions.map((s) => ({
-          type: s.type,
-          rules: s.rules,
-          behavior: s.behavior,
-          destination: s.destination,
-        })) as PermissionUpdate[];
-        result.decisionClassification = 'user_permanent';
+    if (allowed) {
+      // If "Always Allow" was clicked, add to session rules
+      if (alwaysAllow) {
+        this.rules.add(pending.toolName);
       }
 
-      this.sendPermissionResponse(msg.requestId, result);
+      const classification: PermissionDecisionClassification =
+        alwaysAllow ? 'user_permanent' : 'user_temporary';
+
+      // If the CLI suggested permission updates and user clicked "Always Allow",
+      // include those suggestions in the response
+      const updatedPermissions: PermissionUpdate[] | undefined =
+        alwaysAllow && pending.permissionSuggestions
+          ? pending.permissionSuggestions
+          : undefined;
+
+      this.sendAllowResponse(
+        requestId,
+        pending.toolUseId,
+        classification,
+        updatedPermissions,
+      );
     } else {
-      this.sendPermissionResponse(msg.requestId, {
-        behavior: 'deny',
-        message: 'User denied permission',
-        toolUseID: pending.request.tool_use_id,
-        decisionClassification: msg.decisionClassification ?? 'user_reject',
-      });
+      this.sendDenyResponse(requestId, pending.toolUseId, 'User denied permission');
     }
   }
 
   /**
-   * Handle set_permission_mode from the webview (user clicked mode picker).
+   * Handle webview user changing the permission mode via ModeSelector.
    */
-  private handleSetPermissionMode(msg: SetPermissionModeMessage): void {
-    const mode = msg.mode;
-
-    // Gate bypass mode behind the setting
+  private handleWebviewModeChange(mode: PermissionMode): void {
+    // Validate bypass mode requires setting
     if (mode === 'bypassPermissions') {
       const config = vscode.workspace.getConfiguration('openclaudeCode');
       const allowBypass = config.get<boolean>('allowDangerouslySkipPermissions', false);
       if (!allowBypass) {
         vscode.window.showWarningMessage(
-          'Bypass mode requires enabling "openclaudeCode.allowDangerouslySkipPermissions" in settings.',
+          'OpenClaude: Bypass mode requires the "openclaudeCode.allowDangerouslySkipPermissions" ' +
+          'setting to be enabled. Open Settings and search for "allowDangerouslySkipPermissions".',
         );
         return;
       }
     }
 
-    // Update local state
     this.currentMode = mode;
 
     // Send set_permission_mode control_request to CLI
     if (this.writeToStdin) {
-      const controlRequest: SDKControlRequest = {
+      const requestId = `set-mode-${Date.now()}`;
+      this.writeToStdin({
         type: 'control_request',
-        request_id: `perm-mode-${Date.now()}`,
+        request_id: requestId,
         request: {
           subtype: 'set_permission_mode',
           mode,
         },
-      };
-      this.writeToStdin(controlRequest);
-    }
-
-    // Notify all bridges of the mode change
-    const modeMsg: PermissionModeChangedMessage = {
-      type: 'permission_mode_changed',
-      mode,
-    };
-    for (const bridge of this.bridges) {
-      bridge.postMessage(modeMsg);
+      });
     }
   }
 
   /**
-   * Send a control_response back to the CLI with the permission decision.
+   * Notify the webview of a permission mode change via a system status message.
    */
-  private sendPermissionResponse(requestId: string, result: PermissionResult): void {
+  private notifyWebviewModeChange(mode: PermissionMode): void {
+    this.bridge?.postMessage({
+      type: 'cli_output',
+      data: {
+        type: 'system',
+        subtype: 'status',
+        permissionMode: mode,
+        uuid: '',
+        session_id: '',
+      },
+    });
+  }
+
+  /**
+   * Send an "allow" control_response to the CLI.
+   */
+  private sendAllowResponse(
+    requestId: string,
+    toolUseId: string,
+    classification: PermissionDecisionClassification,
+    updatedPermissions?: PermissionUpdate[],
+  ): void {
+    const response: Record<string, unknown> = {
+      behavior: 'allow',
+      toolUseID: toolUseId,
+      decisionClassification: classification,
+    };
+    if (updatedPermissions) {
+      response.updatedPermissions = updatedPermissions;
+    }
+    this.sendControlResponse(requestId, response);
+  }
+
+  /**
+   * Send a "deny" control_response to the CLI.
+   */
+  private sendDenyResponse(
+    requestId: string,
+    toolUseId: string,
+    message: string,
+  ): void {
+    this.sendControlResponse(requestId, {
+      behavior: 'deny',
+      message,
+      toolUseID: toolUseId,
+      decisionClassification: 'user_reject',
+    });
+  }
+
+  /**
+   * Send a control_response envelope to the CLI via stdin.
+   */
+  private sendControlResponse(
+    requestId: string,
+    response: Record<string, unknown>,
+  ): void {
     if (!this.writeToStdin) {
-      console.error('PermissionHandler: No stdin writer — cannot send response');
+      console.error('PermissionHandler: cannot send control_response — no stdin writer');
       return;
     }
-
-    const response: SDKControlResponse = {
+    this.writeToStdin({
       type: 'control_response',
       response: {
         subtype: 'success',
         request_id: requestId,
-        response: result as unknown as Record<string, unknown>,
+        response,
       },
-    };
-
-    this.writeToStdin(response);
+    });
   }
 
   /**
-   * Reject all pending permission requests (e.g., when CLI exits).
+   * Clear all pending requests (e.g., on CLI process restart).
+   * Dismisses any open dialogs in the webview.
    */
-  private rejectAllPending(reason: string): void {
-    for (const [requestId, pending] of this.pendingRequests) {
-      // Tell webview to dismiss dialogs
-      const cancelMsg: CancelRequestMessage = {
+  clearPending(): void {
+    for (const [requestId] of this.pendingRequests) {
+      this.bridge?.postMessage({
         type: 'cancel_request',
         requestId,
-      };
-      for (const bridge of this.bridges) {
-        bridge.postMessage(cancelMsg);
-      }
+      });
     }
     this.pendingRequests.clear();
   }
 
   dispose(): void {
-    this.rejectAllPending('PermissionHandler disposed');
+    this.clearPending();
     for (const d of this.disposables) {
       d.dispose();
     }
     this.disposables.length = 0;
-    this.bridges.clear();
+    this.bridge = null;
+    this.writeToStdin = null;
   }
 }
 ```
 
 - [ ] **Step 2: Verify TypeScript compiles**
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit`
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit 2>&1 | grep -c 'permissionHandler' || echo "0 errors"`
 
-Expected: No type errors
+Expected: No type errors in permissionHandler.ts
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add src/permissions/permissionHandler.ts
-git commit -m "feat(permissions): add PermissionHandler for CLI-to-webview permission flow"
+git commit -m "feat(permissions): add PermissionHandler — CLI permission request coordinator"
 ```
 
 ---
 
-## Task 3: usePermissions React Hook
+## Task 3: Permission Message Router
 
 **Files:**
-- Create: `webview/src/hooks/usePermissions.ts`
+- Create: `src/permissions/permissionRouter.ts`
 
-This hook manages all permission state inside the webview:
-- Queue of pending permission requests (multiple can stack)
-- Current permission mode
-- Methods to respond to permission dialogs
-- Handles `cancel_request` to dismiss stale dialogs
+Routes incoming CLI messages to the PermissionHandler. Called by the main message dispatch loop in ProcessManager/NdjsonTransport (from Story 2).
 
-- [ ] **Step 1: Create webview/src/hooks/usePermissions.ts**
+- [ ] **Step 1: Create the permission message router**
 
 ```typescript
-import { useState, useCallback, useEffect } from 'react';
-import { vscode } from '../vscode';
+// src/permissions/permissionRouter.ts
+import type { PermissionHandler } from './permissionHandler';
+import type {
+  SDKControlRequest,
+  SDKControlCancelRequest,
+  ControlRequestPermission,
+  ControlRequestSetPermissionMode,
+} from '../types/messages';
 
-// ============================================================================
-// Types
-// ============================================================================
+/**
+ * Routes incoming CLI control messages to the PermissionHandler.
+ *
+ * Called by the main message dispatch loop when it receives
+ * control_request or control_cancel_request messages from stdout.
+ *
+ * Usage in the message router:
+ *   const permRouter = new PermissionRouter(permissionHandler);
+ *
+ *   // In message dispatch:
+ *   if (msg.type === 'control_request') {
+ *     if (permRouter.handleControlRequest(msg)) return; // handled
+ *     // ... try other routers (elicitation, hooks, MCP)
+ *   }
+ *   if (msg.type === 'control_cancel_request') {
+ *     permRouter.handleCancelRequest(msg);
+ *   }
+ */
+export class PermissionRouter {
+  constructor(private readonly handler: PermissionHandler) {}
 
-export type PermissionMode = 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions' | 'dontAsk';
+  /**
+   * Route a control_request message to the appropriate handler.
+   * Returns true if the message was handled by permission logic,
+   * false if it should be passed to other handlers.
+   */
+  handleControlRequest(message: SDKControlRequest): boolean {
+    const { request_id, request } = message;
 
-export interface PermissionRequest {
+    switch (request.subtype) {
+      case 'can_use_tool':
+        this.handler.handlePermissionRequest(
+          request_id,
+          request as ControlRequestPermission,
+        );
+        return true;
+
+      case 'set_permission_mode':
+        this.handler.handleCliModeChange(
+          request as ControlRequestSetPermissionMode,
+          request_id,
+        );
+        return true;
+
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Route a control_cancel_request message.
+   * Always handles it (cancel applies to permissions and elicitations).
+   */
+  handleCancelRequest(message: SDKControlCancelRequest): void {
+    this.handler.handleCancelRequest(message.request_id);
+  }
+}
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add src/permissions/permissionRouter.ts
+git commit -m "feat(permissions): add PermissionRouter for CLI message dispatch"
+```
+
+---
+
+## Task 4: Update WebviewBridge Types for Permission Messages
+
+**Files:**
+- Edit: `src/webview/types.ts`
+
+The existing types have basic `PermissionRequestMessage`, `PermissionResponseMessage`, `CancelRequestMessage`, and `SetPermissionModeMessage`. We need to extend `PermissionRequestMessage` to carry the additional fields that PermissionHandler sends (title, description, suggestions, decisionReason, blockedPath, agentId).
+
+- [ ] **Step 1: Extend PermissionRequestMessage with full fields**
+
+In `src/webview/types.ts`, replace the existing `PermissionRequestMessage`:
+
+Old:
+```typescript
+export interface PermissionRequestMessage {
+  type: 'permission_request';
   requestId: string;
   toolName: string;
-  displayName?: string;
+  toolInput: Record<string, unknown>;
+  riskLevel?: string;
+}
+```
+
+New:
+```typescript
+/** Permission request from CLI -> show dialog in webview */
+export interface PermissionRequestMessage {
+  type: 'permission_request';
+  requestId: string;
+  toolName: string;
   toolInput: Record<string, unknown>;
   title?: string;
   description?: string;
   decisionReason?: string;
   blockedPath?: string;
-  permissionSuggestions?: PermissionSuggestion[];
-  toolUseId: string;
+  permissionSuggestions?: Array<{
+    type: string;
+    rules?: Array<{ toolName: string; ruleContent?: string }>;
+    behavior?: string;
+    destination?: string;
+    mode?: string;
+    directories?: string[];
+  }>;
   agentId?: string;
-  timestamp: number;
-}
-
-export interface PermissionSuggestion {
-  type: 'addRules' | 'replaceRules' | 'removeRules';
-  rules: Array<{ toolName: string; ruleContent?: string }>;
-  behavior: 'allow' | 'deny' | 'ask';
-  destination: 'userSettings' | 'projectSettings' | 'localSettings' | 'session' | 'cliArg';
-}
-
-export interface UsePermissionsResult {
-  /** The current pending permission request (top of queue), or null */
-  currentRequest: PermissionRequest | null;
-  /** Number of queued permission requests */
-  pendingCount: number;
-  /** Current permission mode */
-  permissionMode: PermissionMode;
-  /** Allow the current tool use (one-time) */
-  allow: () => void;
-  /** Deny the current tool use */
-  deny: () => void;
-  /** Allow and persist the permission rule ("Always Allow") */
-  alwaysAllow: () => void;
-  /** Change the permission mode */
-  setPermissionMode: (mode: PermissionMode) => void;
-}
-
-// ============================================================================
-// Hook
-// ============================================================================
-
-/**
- * usePermissions — manages permission dialog state and mode switching.
- *
- * Listens for:
- * - `permission_request` from extension host (new dialog)
- * - `cancel_request` from extension host (dismiss stale dialog)
- * - `permission_mode_changed` from extension host (mode update)
- *
- * Sends:
- * - `permission_response` to extension host (user's decision)
- * - `set_permission_mode` to extension host (mode change)
- */
-export function usePermissions(initialMode?: PermissionMode): UsePermissionsResult {
-  const [requests, setRequests] = useState<PermissionRequest[]>([]);
-  const [permissionMode, setPermissionModeState] = useState<PermissionMode>(
-    initialMode ?? 'default',
-  );
-
-  // Listen for messages from the extension host
-  useEffect(() => {
-    const handler = (event: MessageEvent) => {
-      const msg = event.data;
-
-      switch (msg.type) {
-        case 'permission_request':
-          setRequests((prev) => [
-            ...prev,
-            {
-              requestId: msg.requestId,
-              toolName: msg.toolName,
-              displayName: msg.displayName,
-              toolInput: msg.toolInput,
-              title: msg.title,
-              description: msg.description,
-              decisionReason: msg.decisionReason,
-              blockedPath: msg.blockedPath,
-              permissionSuggestions: msg.permissionSuggestions,
-              toolUseId: msg.toolUseId,
-              agentId: msg.agentId,
-              timestamp: Date.now(),
-            },
-          ]);
-          break;
-
-        case 'cancel_request':
-          setRequests((prev) => prev.filter((r) => r.requestId !== msg.requestId));
-          break;
-
-        case 'permission_mode_changed':
-          setPermissionModeState(msg.mode);
-          break;
-      }
-    };
-
-    window.addEventListener('message', handler);
-    return () => window.removeEventListener('message', handler);
-  }, []);
-
-  const currentRequest = requests.length > 0 ? requests[0] : null;
-
-  const respondAndDequeue = useCallback(
-    (
-      behavior: 'allow' | 'deny',
-      updatedPermissions?: PermissionSuggestion[],
-      decisionClassification?: 'user_temporary' | 'user_permanent' | 'user_reject',
-    ) => {
-      if (!currentRequest) return;
-
-      vscode.postMessage({
-        type: 'permission_response',
-        requestId: currentRequest.requestId,
-        behavior,
-        updatedPermissions,
-        decisionClassification,
-      });
-
-      setRequests((prev) => prev.slice(1));
-    },
-    [currentRequest],
-  );
-
-  const allow = useCallback(() => {
-    respondAndDequeue('allow', undefined, 'user_temporary');
-  }, [respondAndDequeue]);
-
-  const deny = useCallback(() => {
-    respondAndDequeue('deny', undefined, 'user_reject');
-  }, [respondAndDequeue]);
-
-  const alwaysAllow = useCallback(() => {
-    if (!currentRequest) return;
-
-    // Use the CLI's suggested permission rules if available,
-    // otherwise create a basic "allow this tool" rule
-    const updatedPermissions: PermissionSuggestion[] =
-      currentRequest.permissionSuggestions && currentRequest.permissionSuggestions.length > 0
-        ? currentRequest.permissionSuggestions
-        : [
-            {
-              type: 'addRules',
-              rules: [{ toolName: currentRequest.toolName }],
-              behavior: 'allow',
-              destination: 'session',
-            },
-          ];
-
-    respondAndDequeue('allow', updatedPermissions, 'user_permanent');
-  }, [currentRequest, respondAndDequeue]);
-
-  const setPermissionMode = useCallback((mode: PermissionMode) => {
-    setPermissionModeState(mode);
-    vscode.postMessage({
-      type: 'set_permission_mode',
-      mode,
-    });
-  }, []);
-
-  return {
-    currentRequest,
-    pendingCount: requests.length,
-    permissionMode,
-    allow,
-    deny,
-    alwaysAllow,
-    setPermissionMode,
-  };
 }
 ```
 
-- [ ] **Step 2: Verify webview TypeScript compiles**
+The `PermissionResponseMessage` already has `alwaysAllow?: boolean` — verify it is present and correct:
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx tsc --noEmit`
+```typescript
+export interface PermissionResponseMessage {
+  type: 'permission_response';
+  requestId: string;
+  allowed: boolean;
+  alwaysAllow?: boolean;
+}
+```
 
-Expected: No type errors
-
-- [ ] **Step 3: Commit**
+- [ ] **Step 2: Commit**
 
 ```bash
-git add webview/src/hooks/usePermissions.ts
-git commit -m "feat(permissions): add usePermissions React hook for dialog state management"
+git add src/webview/types.ts
+git commit -m "feat(permissions): extend PermissionRequestMessage with full CLI fields"
 ```
 
 ---
 
-## Task 4: PermissionDialog Webview Component
+## Task 5: Permission Dialog (React Component)
 
 **Files:**
 - Create: `webview/src/components/dialogs/PermissionDialog.tsx`
 
-The permission dialog is a modal that appears when the CLI needs permission for a tool. It shows:
-- Tool name (or display_name if available)
-- Title/description from the CLI
-- Formatted JSON of the tool input (with syntax highlighting)
-- Blocked path warning (if present)
-- Decision reason text (if present)
-- Agent badge (if from a subagent)
-- Three buttons: Allow Once, Deny, Always Allow
+The modal that appears when the CLI requests tool permission. Shows tool name, formatted input, risk-level coloring, and three action buttons.
 
-- [ ] **Step 1: Create webview/src/components/dialogs/PermissionDialog.tsx**
+- [ ] **Step 1: Create the PermissionDialog component**
 
 ```tsx
-import React, { useMemo } from 'react';
-import type { PermissionRequest } from '../../hooks/usePermissions';
+// webview/src/components/dialogs/PermissionDialog.tsx
+import React, { useCallback, useMemo } from 'react';
+import { vscode } from '../../vscode';
+
+export interface PermissionRequest {
+  requestId: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  title?: string;
+  description?: string;
+  decisionReason?: string;
+  blockedPath?: string;
+  agentId?: string;
+}
 
 interface PermissionDialogProps {
   request: PermissionRequest;
-  pendingCount: number;
-  onAllow: () => void;
-  onDeny: () => void;
-  onAlwaysAllow: () => void;
+  onDismiss: (requestId: string) => void;
 }
 
 /**
- * PermissionDialog — modal overlay requesting user approval for a tool.
+ * PermissionDialog — modal shown when the CLI asks for tool permission.
  *
- * Visual design extracted from Claude Code extension webview:
- * - Dark overlay backdrop
- * - Centered card with tool name header
- * - JSON-formatted tool input in a scrollable code block
- * - Three action buttons at the bottom
+ * Layout (matches Claude Code extension):
+ * +--------------------------------------+
+ * | [Icon] Tool Permission               |
+ * +--------------------------------------+
+ * | Claude wants to use: ToolName        |
+ * |                                      |
+ * | { formatted JSON input }             |
+ * |                                      |
+ * | [Decision reason if present]         |
+ * |                                      |
+ * | [Deny]  [Always Allow]  [Allow]      |
+ * +--------------------------------------+
  */
-export function PermissionDialog({
+export const PermissionDialog: React.FC<PermissionDialogProps> = ({
   request,
-  pendingCount,
-  onAllow,
-  onDeny,
-  onAlwaysAllow,
-}: PermissionDialogProps) {
+  onDismiss,
+}) => {
   const formattedInput = useMemo(() => {
-    try {
-      return JSON.stringify(request.toolInput, null, 2);
-    } catch {
-      return String(request.toolInput);
-    }
-  }, [request.toolInput]);
+    return formatToolInput(request.toolName, request.toolInput);
+  }, [request.toolName, request.toolInput]);
 
-  const displayName = request.displayName ?? request.toolName;
+  const handleAllow = useCallback(() => {
+    vscode.postMessage({
+      type: 'permission_response',
+      requestId: request.requestId,
+      allowed: true,
+    });
+    onDismiss(request.requestId);
+  }, [request.requestId, onDismiss]);
+
+  const handleAlwaysAllow = useCallback(() => {
+    vscode.postMessage({
+      type: 'permission_response',
+      requestId: request.requestId,
+      allowed: true,
+      alwaysAllow: true,
+    });
+    onDismiss(request.requestId);
+  }, [request.requestId, onDismiss]);
+
+  const handleDeny = useCallback(() => {
+    vscode.postMessage({
+      type: 'permission_response',
+      requestId: request.requestId,
+      allowed: false,
+    });
+    onDismiss(request.requestId);
+  }, [request.requestId, onDismiss]);
+
+  // Keyboard shortcuts: Enter = Allow, Escape = Deny
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleAllow();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        handleDeny();
+      }
+    },
+    [handleAllow, handleDeny],
+  );
+
+  // Determine risk level coloring based on tool name
+  const riskColor = useMemo(() => {
+    const destructiveTools = ['Bash', 'BashTool', 'Execute', 'rm', 'delete'];
+    const editTools = ['Write', 'Edit', 'FileEditTool', 'FileWriteTool', 'MultiEdit'];
+    const toolLower = request.toolName.toLowerCase();
+
+    if (destructiveTools.some((t) => toolLower.includes(t.toLowerCase()))) {
+      return 'text-red-400';
+    }
+    if (editTools.some((t) => toolLower.includes(t.toLowerCase()))) {
+      return 'text-yellow-400';
+    }
+    return 'text-blue-400';
+  }, [request.toolName]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="w-full max-w-lg mx-4 rounded-lg border border-vscode-border bg-vscode-bg shadow-xl">
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center pb-4 sm:items-center sm:pb-0"
+      onKeyDown={handleKeyDown}
+      tabIndex={-1}
+      ref={(el) => el?.focus()}
+    >
+      {/* Backdrop */}
+      <div className="absolute inset-0 bg-black/40" onClick={handleDeny} />
+
+      {/* Dialog */}
+      <div className="relative bg-vscode-editor-bg border border-vscode-border rounded-lg shadow-xl max-w-lg w-full mx-4 overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-vscode-border">
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-yellow-500" />
-            <h2 className="text-sm font-semibold text-vscode-fg">
-              Permission Request
-            </h2>
-            {pendingCount > 1 && (
-              <span className="text-xs px-1.5 py-0.5 rounded bg-vscode-badge-bg text-vscode-badge-fg">
-                +{pendingCount - 1} more
-              </span>
-            )}
-          </div>
+        <div className="flex items-center gap-2 px-4 py-3 border-b border-vscode-border bg-vscode-sidebar-bg">
+          <svg
+            className={`w-4 h-4 flex-shrink-0 ${riskColor}`}
+            viewBox="0 0 16 16"
+            fill="currentColor"
+          >
+            <path d="M8 1.5a.5.5 0 01.424.235l6.5 10.5A.5.5 0 0114.5 13h-13a.5.5 0 01-.424-.765l6.5-10.5A.5.5 0 018 1.5zM7.25 9.5v-3h1.5v3h-1.5zm0 2.25v-1.5h1.5v1.5h-1.5z" />
+          </svg>
+          <span className="text-sm font-semibold text-vscode-fg">
+            {request.title || 'Tool Permission'}
+          </span>
           {request.agentId && (
-            <span className="text-xs px-2 py-0.5 rounded bg-vscode-badge-bg text-vscode-badge-fg">
-              Agent: {request.agentId}
+            <span className="text-xs opacity-50 ml-auto font-mono">
+              {request.agentId}
             </span>
           )}
         </div>
 
         {/* Body */}
-        <div className="px-4 py-3 space-y-3 max-h-[60vh] overflow-y-auto">
+        <div className="px-4 py-3 space-y-3 max-h-80 overflow-y-auto">
           {/* Tool name */}
           <div>
-            <span className="text-xs uppercase tracking-wider text-vscode-fg/50">Tool</span>
-            <p className="text-sm font-medium text-vscode-fg mt-0.5">{displayName}</p>
+            <span className="text-[11px] opacity-50 uppercase tracking-wider">Tool</span>
+            <p className={`text-sm font-mono font-semibold mt-0.5 ${riskColor}`}>
+              {request.toolName}
+            </p>
           </div>
-
-          {/* Title / description */}
-          {(request.title || request.description) && (
-            <div>
-              {request.title && (
-                <p className="text-sm text-vscode-fg">{request.title}</p>
-              )}
-              {request.description && (
-                <p className="text-xs text-vscode-fg/70 mt-1">{request.description}</p>
-              )}
-            </div>
-          )}
 
           {/* Decision reason */}
           {request.decisionReason && (
-            <div className="text-xs text-vscode-fg/60 italic">
-              {request.decisionReason}
+            <div>
+              <span className="text-[11px] opacity-50 uppercase tracking-wider">Reason</span>
+              <p className="text-xs opacity-80 mt-0.5">{request.decisionReason}</p>
             </div>
           )}
 
-          {/* Blocked path warning */}
+          {/* Blocked path */}
           {request.blockedPath && (
-            <div className="flex items-center gap-2 px-3 py-2 rounded bg-yellow-500/10 border border-yellow-500/30">
-              <span className="text-yellow-500 text-sm">&#9888;</span>
-              <span className="text-xs text-yellow-400">
-                Blocked path: <code className="font-mono">{request.blockedPath}</code>
-              </span>
+            <div className="flex items-center gap-1.5 text-xs text-yellow-400 bg-yellow-400/10 rounded px-2 py-1">
+              <span>Blocked path:</span>
+              <code className="font-mono">{request.blockedPath}</code>
             </div>
           )}
 
           {/* Tool input */}
           <div>
-            <span className="text-xs uppercase tracking-wider text-vscode-fg/50">Input</span>
-            <pre className="mt-1 p-3 rounded bg-black/20 border border-vscode-border text-xs font-mono text-vscode-fg overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap break-all">
+            <span className="text-[11px] opacity-50 uppercase tracking-wider">Input</span>
+            <pre className="mt-1 text-xs font-mono bg-vscode-input-bg border border-vscode-input-border rounded p-2.5 overflow-x-auto whitespace-pre-wrap max-h-40 overflow-y-auto leading-relaxed">
               {formattedInput}
             </pre>
           </div>
+
+          {/* Description from CLI */}
+          {request.description && (
+            <p className="text-xs opacity-50 italic">{request.description}</p>
+          )}
         </div>
 
-        {/* Footer / Actions */}
-        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-vscode-border">
+        {/* Actions */}
+        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-vscode-border bg-vscode-sidebar-bg">
+          <span className="text-[10px] opacity-30 mr-auto">
+            Enter=Allow Esc=Deny
+          </span>
           <button
-            onClick={onDeny}
-            className="px-3 py-1.5 text-xs rounded border border-vscode-border text-vscode-fg hover:bg-vscode-fg/10 transition-colors"
+            onClick={handleDeny}
+            className="px-3 py-1.5 text-xs rounded border border-vscode-border text-vscode-fg hover:bg-vscode-list-hover-bg transition-colors"
           >
             Deny
           </button>
           <button
-            onClick={onAlwaysAllow}
-            className="px-3 py-1.5 text-xs rounded border border-vscode-border text-vscode-fg hover:bg-vscode-fg/10 transition-colors"
+            onClick={handleAlwaysAllow}
+            className="px-3 py-1.5 text-xs rounded border border-vscode-border text-vscode-fg hover:bg-vscode-list-hover-bg transition-colors"
           >
             Always Allow
           </button>
           <button
-            onClick={onAllow}
-            className="px-3 py-1.5 text-xs rounded bg-vscode-button-bg text-vscode-button-fg hover:bg-vscode-button-hover transition-colors font-medium"
+            onClick={handleAllow}
+            className="px-3 py-1.5 text-xs rounded bg-vscode-button-bg text-vscode-button-fg hover:bg-vscode-button-hover-bg transition-colors font-medium"
+            autoFocus
           >
             Allow
           </button>
@@ -874,43 +909,355 @@ export function PermissionDialog({
       </div>
     </div>
   );
+};
+
+/**
+ * Format tool input for display.
+ * For common tools, show a more human-readable format than raw JSON.
+ */
+function formatToolInput(
+  toolName: string,
+  input: Record<string, unknown>,
+): string {
+  const toolLower = toolName.toLowerCase();
+
+  // Bash/Execute tools — show the command prominently
+  if (toolLower.includes('bash') || toolLower.includes('execute')) {
+    if (typeof input.command === 'string') {
+      return input.command;
+    }
+  }
+
+  // File edit tools — show file path and diff summary
+  if (toolLower.includes('edit') || toolLower.includes('write')) {
+    const parts: string[] = [];
+    if (input.file_path || input.path) {
+      parts.push(`File: ${input.file_path || input.path}`);
+    }
+    if (input.old_string && input.new_string) {
+      parts.push(`Replace:\n  ${truncate(String(input.old_string), 120)}`);
+      parts.push(`With:\n  ${truncate(String(input.new_string), 120)}`);
+    }
+    if (input.content) {
+      parts.push(`Content:\n  ${truncate(String(input.content), 200)}`);
+    }
+    if (parts.length > 0) {
+      return parts.join('\n\n');
+    }
+  }
+
+  // Read/search tools — show the target
+  if (
+    toolLower.includes('read') ||
+    toolLower.includes('glob') ||
+    toolLower.includes('grep') ||
+    toolLower.includes('search')
+  ) {
+    const target = input.file_path || input.path || input.pattern || input.query;
+    if (typeof target === 'string') {
+      return target;
+    }
+  }
+
+  // Fallback: pretty-print JSON
+  return JSON.stringify(input, null, 2);
+}
+
+function truncate(str: string, maxLen: number): string {
+  if (str.length <= maxLen) return str;
+  return str.slice(0, maxLen) + '...';
 }
 ```
 
-- [ ] **Step 2: Verify webview TypeScript compiles**
+- [ ] **Step 2: Verify no syntax errors**
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx tsc --noEmit`
-
-Expected: No type errors
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx tsc --noEmit 2>&1 | head -20`
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add webview/src/components/dialogs/PermissionDialog.tsx
-git commit -m "feat(permissions): add PermissionDialog webview component"
+git commit -m "feat(permissions): add PermissionDialog React component with tool input formatting"
 ```
 
 ---
 
-## Task 5: PermissionModeIndicator Component
+## Task 6: usePermissions Hook
+
+**Files:**
+- Create: `webview/src/hooks/usePermissions.ts`
+
+React hook that manages the queue of pending permission requests in the webview. Listens for incoming `permission_request` and `cancel_request` messages from the extension host.
+
+- [ ] **Step 1: Create the usePermissions hook**
+
+```typescript
+// webview/src/hooks/usePermissions.ts
+import { useState, useEffect, useCallback } from 'react';
+import type { PermissionRequest } from '../components/dialogs/PermissionDialog';
+
+/**
+ * usePermissions — manages the queue of pending permission request dialogs.
+ *
+ * Listens for:
+ * - 'permission_request' messages from extension host (add to queue)
+ * - 'cancel_request' messages from extension host (remove from queue)
+ *
+ * Returns:
+ * - pendingRequests: full array of pending requests
+ * - currentRequest: the oldest pending request (FIFO), shown in the dialog
+ * - dismissRequest: remove a request from the queue (after user responds)
+ * - hasPending: boolean convenience flag
+ */
+export function usePermissions() {
+  const [pendingRequests, setPendingRequests] = useState<PermissionRequest[]>([]);
+
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      const message = event.data;
+
+      if (message.type === 'permission_request') {
+        const req: PermissionRequest = {
+          requestId: message.requestId,
+          toolName: message.toolName,
+          toolInput: message.toolInput || {},
+          title: message.title,
+          description: message.description,
+          decisionReason: message.decisionReason,
+          blockedPath: message.blockedPath,
+          agentId: message.agentId,
+        };
+        setPendingRequests((prev) => [...prev, req]);
+      }
+
+      if (message.type === 'cancel_request') {
+        setPendingRequests((prev) =>
+          prev.filter((r) => r.requestId !== message.requestId),
+        );
+      }
+    };
+
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  }, []);
+
+  const dismissRequest = useCallback((requestId: string) => {
+    setPendingRequests((prev) =>
+      prev.filter((r) => r.requestId !== requestId),
+    );
+  }, []);
+
+  // FIFO: show the oldest pending request first
+  const currentRequest = pendingRequests.length > 0 ? pendingRequests[0] : null;
+
+  return {
+    pendingRequests,
+    currentRequest,
+    dismissRequest,
+    hasPending: pendingRequests.length > 0,
+    pendingCount: pendingRequests.length,
+  };
+}
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add webview/src/hooks/usePermissions.ts
+git commit -m "feat(permissions): add usePermissions hook for managing dialog queue"
+```
+
+---
+
+## Task 7: Permission Mode Indicator & Mode Selector
 
 **Files:**
 - Create: `webview/src/components/input/PermissionModeIndicator.tsx`
+- Create: `webview/src/components/input/ModeSelector.tsx`
 
-This component sits in the `ContextFooter` area of the input toolbar. It shows the current permission mode as a badge. Clicking it opens a dropdown to switch modes.
+The PermissionModeIndicator is a small badge in the input footer. Clicking opens the ModeSelector dropdown. Selecting a mode sends `set_permission_mode` to the extension host.
 
-- [ ] **Step 1: Create webview/src/components/input/PermissionModeIndicator.tsx**
+- [ ] **Step 1: Create the ModeSelector dropdown component**
 
 ```tsx
-import React, { useState, useRef, useEffect } from 'react';
-import type { PermissionMode } from '../../hooks/usePermissions';
+// webview/src/components/input/ModeSelector.tsx
+import React, { useCallback, useEffect, useRef } from 'react';
+import { vscode } from '../../vscode';
+
+export type PermissionMode =
+  | 'default'
+  | 'plan'
+  | 'acceptEdits'
+  | 'bypassPermissions'
+  | 'dontAsk';
+
+interface ModeSelectorProps {
+  currentMode: PermissionMode;
+  onClose: () => void;
+}
+
+interface ModeOption {
+  mode: PermissionMode;
+  label: string;
+  shortcut?: string;
+  description: string;
+  color: string;
+  dangerGated?: boolean;
+}
+
+const MODE_OPTIONS: ModeOption[] = [
+  {
+    mode: 'default',
+    label: 'Default',
+    description: 'Ask for permission on dangerous operations',
+    color: 'text-blue-400',
+  },
+  {
+    mode: 'plan',
+    label: 'Plan',
+    shortcut: '/plan',
+    description: 'Planning mode — generates a plan document, no tool execution',
+    color: 'text-purple-400',
+  },
+  {
+    mode: 'acceptEdits',
+    label: 'Accept Edits',
+    description: 'Auto-accept file edits, still ask for other operations',
+    color: 'text-green-400',
+  },
+  {
+    mode: 'bypassPermissions',
+    label: 'Bypass',
+    description: 'Skip all permission checks (requires setting)',
+    color: 'text-red-400',
+    dangerGated: true,
+  },
+  {
+    mode: 'dontAsk',
+    label: "Don't Ask",
+    description: 'Never prompt for permissions — deny anything not pre-approved',
+    color: 'text-yellow-400',
+  },
+];
+
+/**
+ * ModeSelector — dropdown for switching permission modes.
+ *
+ * Opens above/below the PermissionModeIndicator. Clicking a mode sends
+ * set_permission_mode to the extension host and closes the dropdown.
+ */
+export const ModeSelector: React.FC<ModeSelectorProps> = ({
+  currentMode,
+  onClose,
+}) => {
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Close on outside click or Escape
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        onClose();
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onClose]);
+
+  const handleSelect = useCallback(
+    (mode: PermissionMode) => {
+      vscode.postMessage({
+        type: 'set_permission_mode',
+        mode,
+      });
+      onClose();
+    },
+    [onClose],
+  );
+
+  return (
+    <div
+      ref={ref}
+      className="absolute bottom-full left-0 mb-1 w-72 bg-vscode-editor-bg border border-vscode-border rounded-lg shadow-xl z-50 overflow-hidden"
+    >
+      <div className="px-3 py-2 border-b border-vscode-border">
+        <span className="text-[11px] font-semibold opacity-50 uppercase tracking-wider">
+          Permission Mode
+        </span>
+      </div>
+      <div className="py-1">
+        {MODE_OPTIONS.map((option) => {
+          const isActive = currentMode === option.mode;
+          return (
+            <button
+              key={option.mode}
+              onClick={() => handleSelect(option.mode)}
+              className={`w-full flex items-start gap-2.5 px-3 py-2 text-left hover:bg-vscode-list-hover-bg transition-colors ${
+                isActive ? 'bg-vscode-list-active-bg' : ''
+              }`}
+            >
+              {/* Colored dot indicator */}
+              <div
+                className={`w-2 h-2 rounded-full mt-1 flex-shrink-0 ${
+                  isActive ? option.color.replace('text-', 'bg-') : 'bg-transparent border border-current opacity-30'
+                }`}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`text-xs font-medium ${isActive ? option.color : 'text-vscode-fg'}`}
+                  >
+                    {option.label}
+                  </span>
+                  {option.shortcut && (
+                    <code className="text-[10px] opacity-40 font-mono">
+                      {option.shortcut}
+                    </code>
+                  )}
+                  {isActive && (
+                    <span className="text-[10px] opacity-40 ml-auto">current</span>
+                  )}
+                  {option.dangerGated && !isActive && (
+                    <span className="text-[10px] text-red-400/70 ml-auto">
+                      requires setting
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] opacity-50 leading-snug mt-0.5">
+                  {option.description}
+                </p>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+```
+
+- [ ] **Step 2: Create the PermissionModeIndicator component**
+
+```tsx
+// webview/src/components/input/PermissionModeIndicator.tsx
+import React, { useState, useCallback } from 'react';
+import { ModeSelector } from './ModeSelector';
+import type { PermissionMode } from './ModeSelector';
 
 interface PermissionModeIndicatorProps {
   mode: PermissionMode;
-  onModeChange: (mode: PermissionMode) => void;
 }
 
-/** Human-readable labels for each permission mode */
+/** Human-readable labels */
 const MODE_LABELS: Record<PermissionMode, string> = {
   default: 'Default',
   plan: 'Plan',
@@ -919,469 +1266,324 @@ const MODE_LABELS: Record<PermissionMode, string> = {
   dontAsk: "Don't Ask",
 };
 
-/** Short descriptions for the dropdown */
-const MODE_DESCRIPTIONS: Record<PermissionMode, string> = {
-  default: 'Prompts for dangerous operations',
-  plan: 'Planning mode, no tool execution',
-  acceptEdits: 'Auto-accept file edits',
-  bypassPermissions: 'Bypass all permission checks',
-  dontAsk: "Deny if not pre-approved",
-};
-
-/** Color indicator for each mode */
+/** Color per mode */
 const MODE_COLORS: Record<PermissionMode, string> = {
-  default: 'bg-blue-500',
-  plan: 'bg-purple-500',
-  acceptEdits: 'bg-green-500',
-  bypassPermissions: 'bg-red-500',
-  dontAsk: 'bg-gray-500',
+  default: 'text-blue-400',
+  plan: 'text-purple-400',
+  acceptEdits: 'text-green-400',
+  bypassPermissions: 'text-red-400',
+  dontAsk: 'text-yellow-400',
 };
-
-/** Shield icon SVG */
-function ShieldIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      width="12"
-      height="12"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-    </svg>
-  );
-}
 
 /**
- * PermissionModeIndicator — footer badge showing current mode with dropdown picker.
- *
- * Visual design matches the ModeSelector button in Claude Code's input toolbar:
- * - Small badge with shield icon and mode label
- * - Click opens a dropdown with all modes
- * - Active mode highlighted
- * - Bypass mode shows warning color
+ * PermissionModeIndicator — small badge in the input footer showing the
+ * current permission mode. Clicking opens the ModeSelector dropdown.
  */
-export function PermissionModeIndicator({ mode, onModeChange }: PermissionModeIndicatorProps) {
-  const [isOpen, setIsOpen] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
+export const PermissionModeIndicator: React.FC<PermissionModeIndicatorProps> = ({
+  mode,
+}) => {
+  const [showPicker, setShowPicker] = useState(false);
 
-  // Close dropdown on outside click
-  useEffect(() => {
-    if (!isOpen) return;
+  const togglePicker = useCallback(() => {
+    setShowPicker((prev) => !prev);
+  }, []);
 
-    const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setIsOpen(false);
-      }
-    };
-
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [isOpen]);
-
-  // Close dropdown on Escape
-  useEffect(() => {
-    if (!isOpen) return;
-
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setIsOpen(false);
-      }
-    };
-
-    document.addEventListener('keydown', handleEscape);
-    return () => document.removeEventListener('keydown', handleEscape);
-  }, [isOpen]);
-
-  const handleSelect = (selectedMode: PermissionMode) => {
-    onModeChange(selectedMode);
-    setIsOpen(false);
-  };
-
-  const modes: PermissionMode[] = ['default', 'plan', 'acceptEdits', 'bypassPermissions', 'dontAsk'];
+  const closePicker = useCallback(() => {
+    setShowPicker(false);
+  }, []);
 
   return (
-    <div className="relative" ref={dropdownRef}>
-      {/* Badge button */}
+    <div className="relative inline-flex">
       <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="flex items-center gap-1 px-2 py-0.5 rounded text-xs text-vscode-fg/70 hover:text-vscode-fg hover:bg-vscode-fg/5 transition-colors"
-        title={`Permission mode: ${MODE_LABELS[mode]}`}
+        onClick={togglePicker}
+        className={`flex items-center gap-1.5 px-2 py-0.5 rounded text-xs hover:bg-vscode-list-hover-bg transition-colors ${MODE_COLORS[mode]}`}
+        title={`Permission mode: ${MODE_LABELS[mode]}. Click to change.`}
       >
-        <ShieldIcon className="w-3 h-3" />
-        <div className={`w-1.5 h-1.5 rounded-full ${MODE_COLORS[mode]}`} />
-        <span>{MODE_LABELS[mode]}</span>
+        {/* Shield icon */}
+        <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M8 0L1 3v5c0 4.25 3 7.25 7 8 4-.75 7-3.75 7-8V3L8 0zm0 1.5l5.5 2.25V8c0 3.5-2.5 6-5.5 6.75C4.5 14 2 11.5 2 8V3.75L8 1.5z" />
+        </svg>
+        <span className="font-medium">{MODE_LABELS[mode]}</span>
+        {/* Dropdown caret */}
+        <svg className="w-2.5 h-2.5 opacity-50" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M4 6l4 4 4-4H4z" />
+        </svg>
       </button>
 
-      {/* Dropdown */}
-      {isOpen && (
-        <div className="absolute bottom-full left-0 mb-1 w-64 rounded-lg border border-vscode-border bg-vscode-bg shadow-xl z-50 overflow-hidden">
-          <div className="px-3 py-2 border-b border-vscode-border">
-            <span className="text-xs font-semibold text-vscode-fg/50 uppercase tracking-wider">
-              Permission Mode
-            </span>
-          </div>
-          <div className="py-1">
-            {modes.map((m) => (
-              <button
-                key={m}
-                onClick={() => handleSelect(m)}
-                className={`w-full text-left px-3 py-2 text-xs transition-colors ${
-                  m === mode
-                    ? 'bg-vscode-button-bg/20 text-vscode-fg'
-                    : 'text-vscode-fg/70 hover:bg-vscode-fg/5 hover:text-vscode-fg'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <div className={`w-2 h-2 rounded-full ${MODE_COLORS[m]}`} />
-                  <span className="font-medium">{MODE_LABELS[m]}</span>
-                  {m === mode && (
-                    <span className="ml-auto text-vscode-fg/40">&#10003;</span>
-                  )}
-                </div>
-                <p className="text-vscode-fg/50 mt-0.5 ml-4">{MODE_DESCRIPTIONS[m]}</p>
-                {m === 'bypassPermissions' && (
-                  <p className="text-red-400/70 mt-0.5 ml-4 text-[10px]">
-                    Requires allowDangerouslySkipPermissions setting
-                  </p>
-                )}
-              </button>
-            ))}
-          </div>
-        </div>
+      {showPicker && (
+        <ModeSelector currentMode={mode} onClose={closePicker} />
       )}
     </div>
   );
-}
+};
 ```
-
-- [ ] **Step 2: Verify webview TypeScript compiles**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx tsc --noEmit`
-
-Expected: No type errors
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add webview/src/components/input/PermissionModeIndicator.tsx
-git commit -m "feat(permissions): add PermissionModeIndicator footer component with mode picker"
+git add webview/src/components/input/PermissionModeIndicator.tsx webview/src/components/input/ModeSelector.tsx
+git commit -m "feat(permissions): add PermissionModeIndicator badge and ModeSelector dropdown"
 ```
 
 ---
 
-## Task 6: PlanViewer Component
+## Task 8: Basic PlanViewer Component
 
 **Files:**
 - Create: `webview/src/components/dialogs/PlanViewer.tsx`
 
-When the permission mode is `plan`, the CLI sends a plan document instead of executing tools. The plan arrives as markdown content within the assistant message. The `PlanViewer` renders it in a rich view with Accept/Request Changes buttons. (The full inline comment system is Story 19 — here we build the base viewer.)
+In plan mode, the CLI sends a plan document (markdown) as part of the assistant message. Story 7 provides a basic rendering with section parsing and approve/revise buttons. The full inline comment system is deferred to Story 19.
 
-- [ ] **Step 1: Create webview/src/components/dialogs/PlanViewer.tsx**
+- [ ] **Step 1: Create the basic PlanViewer component**
 
 ```tsx
-import React, { useState } from 'react';
+// webview/src/components/dialogs/PlanViewer.tsx
+import React, { useCallback, useMemo, useState } from 'react';
+import { vscode } from '../../vscode';
 
 interface PlanViewerProps {
-  /** Markdown content of the plan */
+  /** The plan markdown content from the CLI */
+  planContent: string;
+  /** Session ID for context */
+  sessionId?: string;
+  /** Called when user approves or requests revision */
+  onAction: (action: 'approve' | 'revise', feedback?: string) => void;
+}
+
+/** A parsed section of the plan */
+interface PlanSection {
+  heading: string | null;
+  headingLevel: number;
   content: string;
-  /** Called when user accepts the plan */
-  onAccept: () => void;
-  /** Called when user requests revision with feedback */
-  onRequestRevision: (feedback: string) => void;
-  /** Whether the plan is still being streamed */
-  isStreaming?: boolean;
 }
 
 /**
- * PlanViewer — renders a plan document from the CLI in plan mode.
+ * PlanViewer — renders a CLI-generated plan document.
  *
- * This is the base plan viewer. The full inline comment system (text selection,
- * anchored comments, numbered indicators) is Story 19.
+ * In plan mode, the CLI generates a plan instead of executing tools.
+ * This component renders the plan as formatted sections and provides
+ * approve/revise buttons.
  *
- * For now, this renders the plan as formatted markdown with:
- * - Accept button (sends user message to proceed)
- * - Request Revision textarea + button
- * - Visual indicator that this is a plan, not executed code
+ * Story 7 scope: basic markdown section rendering + approve/revise actions.
+ * Story 19 scope: text selection, inline comments, numbered indicators,
+ *                 <mark> highlighting, clear-context option.
  */
-export function PlanViewer({
-  content,
-  onAccept,
-  onRequestRevision,
-  isStreaming = false,
-}: PlanViewerProps) {
-  const [isRevising, setIsRevising] = useState(false);
+export const PlanViewer: React.FC<PlanViewerProps> = ({
+  planContent,
+  sessionId,
+  onAction,
+}) => {
+  const sections = useMemo(() => parsePlanSections(planContent), [planContent]);
   const [feedback, setFeedback] = useState('');
+  const [showFeedback, setShowFeedback] = useState(false);
 
-  const handleRequestRevision = () => {
-    if (feedback.trim()) {
-      onRequestRevision(feedback.trim());
-      setFeedback('');
-      setIsRevising(false);
+  const handleApprove = useCallback(() => {
+    onAction('approve', feedback.trim() || undefined);
+  }, [onAction, feedback]);
+
+  const handleRevise = useCallback(() => {
+    if (!showFeedback) {
+      setShowFeedback(true);
+      return;
     }
-  };
+    if (feedback.trim()) {
+      onAction('revise', feedback.trim());
+    }
+  }, [onAction, feedback, showFeedback]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        handleRevise();
+      }
+    },
+    [handleRevise],
+  );
 
   return (
-    <div className="rounded-lg border border-purple-500/30 bg-purple-500/5 overflow-hidden">
-      {/* Plan header */}
-      <div className="flex items-center justify-between px-4 py-2 bg-purple-500/10 border-b border-purple-500/20">
-        <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full bg-purple-500" />
-          <span className="text-xs font-semibold text-purple-400 uppercase tracking-wider">
-            Plan
-          </span>
-          {isStreaming && (
-            <span className="text-xs text-purple-400/60 animate-pulse">
-              Generating...
-            </span>
-          )}
-        </div>
+    <div className="border border-purple-500/30 rounded-lg overflow-hidden my-2 bg-purple-500/5">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-purple-500/20">
+        <svg className="w-4 h-4 text-purple-400 flex-shrink-0" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M4 1h8a1 1 0 011 1v12a1 1 0 01-1 1H4a1 1 0 01-1-1V2a1 1 0 011-1zm1 2v2h6V3H5zm0 3.5v1.5h6V6.5H5zm0 3v1.5h4V9.5H5z" />
+        </svg>
+        <span className="text-sm font-semibold text-purple-400">Plan</span>
+        <span className="text-[11px] opacity-40 ml-auto">
+          {sections.length} section{sections.length !== 1 ? 's' : ''}
+        </span>
       </div>
 
-      {/* Plan content — rendered as preformatted text for now.
-          Story 16 (Content Block Renderers) will add proper markdown rendering.
-          Story 19 will add inline comments. */}
-      <div className="px-4 py-3 max-h-[50vh] overflow-y-auto">
-        <pre className="text-sm text-vscode-fg whitespace-pre-wrap font-mono leading-relaxed">
-          {content}
-        </pre>
-      </div>
-
-      {/* Action bar */}
-      {!isStreaming && (
-        <div className="px-4 py-3 border-t border-purple-500/20 space-y-2">
-          {!isRevising ? (
-            <div className="flex items-center justify-end gap-2">
-              <button
-                onClick={() => setIsRevising(true)}
-                className="px-3 py-1.5 text-xs rounded border border-vscode-border text-vscode-fg hover:bg-vscode-fg/10 transition-colors"
+      {/* Plan content — scrollable */}
+      <div className="px-4 py-3 space-y-4 max-h-[28rem] overflow-y-auto">
+        {sections.map((section, index) => (
+          <div key={index}>
+            {section.heading && (
+              <h3
+                className={`font-semibold text-vscode-fg mb-1 ${
+                  section.headingLevel === 1
+                    ? 'text-sm'
+                    : section.headingLevel === 2
+                      ? 'text-[13px]'
+                      : 'text-xs'
+                }`}
               >
-                Request Revision
-              </button>
-              <button
-                onClick={onAccept}
-                className="px-3 py-1.5 text-xs rounded bg-vscode-button-bg text-vscode-button-fg hover:bg-vscode-button-hover transition-colors font-medium"
-              >
-                Accept Plan
-              </button>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              <textarea
-                value={feedback}
-                onChange={(e) => setFeedback(e.target.value)}
-                placeholder="Describe what you'd like changed..."
-                className="w-full px-3 py-2 text-xs rounded border border-vscode-input-border bg-vscode-input-bg text-vscode-input-fg resize-none focus:outline-none focus:border-vscode-link"
-                rows={3}
-                autoFocus
-              />
-              <div className="flex items-center justify-end gap-2">
-                <button
-                  onClick={() => {
-                    setIsRevising(false);
-                    setFeedback('');
-                  }}
-                  className="px-3 py-1.5 text-xs rounded border border-vscode-border text-vscode-fg hover:bg-vscode-fg/10 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={handleRequestRevision}
-                  disabled={!feedback.trim()}
-                  className="px-3 py-1.5 text-xs rounded bg-vscode-button-bg text-vscode-button-fg hover:bg-vscode-button-hover transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  Send Feedback
-                </button>
+                {section.heading}
+              </h3>
+            )}
+            {section.content && (
+              <div className="text-xs text-vscode-fg/80 whitespace-pre-wrap font-mono leading-relaxed">
+                {section.content}
               </div>
-            </div>
-          )}
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Feedback textarea (shown when "Request Revision" is clicked first time) */}
+      {showFeedback && (
+        <div className="px-4 py-2 border-t border-purple-500/20">
+          <label className="text-[11px] opacity-50 uppercase tracking-wider block mb-1">
+            Revision feedback
+          </label>
+          <textarea
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Describe what you'd like changed..."
+            className="w-full bg-vscode-input-bg border border-vscode-input-border rounded px-2.5 py-1.5 text-xs text-vscode-input-fg outline-none resize-none focus:border-purple-500/50"
+            rows={3}
+            autoFocus
+          />
+          <p className="text-[10px] opacity-30 mt-1">
+            Cmd+Enter to send
+          </p>
         </div>
       )}
+
+      {/* Actions */}
+      <div className="flex items-center justify-end gap-2 px-4 py-2.5 border-t border-purple-500/20">
+        <button
+          onClick={handleRevise}
+          className="px-3 py-1.5 text-xs rounded border border-vscode-border text-vscode-fg hover:bg-vscode-list-hover-bg transition-colors"
+        >
+          {showFeedback ? 'Send Revision' : 'Request Revision'}
+        </button>
+        <button
+          onClick={handleApprove}
+          className="px-3 py-1.5 text-xs rounded bg-purple-600 text-white hover:bg-purple-700 transition-colors font-medium"
+        >
+          Approve Plan
+        </button>
+      </div>
     </div>
   );
+};
+
+/**
+ * Parse plan markdown into sections split on headings.
+ */
+function parsePlanSections(markdown: string): PlanSection[] {
+  const lines = markdown.split('\n');
+  const sections: PlanSection[] = [];
+  let currentHeading: string | null = null;
+  let currentLevel = 0;
+  let currentContent: string[] = [];
+
+  for (const line of lines) {
+    const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      // Save previous section if it has content
+      if (currentContent.length > 0 || currentHeading !== null) {
+        sections.push({
+          heading: currentHeading,
+          headingLevel: currentLevel,
+          content: currentContent.join('\n').trim(),
+        });
+      }
+      currentHeading = headingMatch[2];
+      currentLevel = headingMatch[1].length;
+      currentContent = [];
+    } else {
+      currentContent.push(line);
+    }
+  }
+
+  // Push the last section
+  if (currentContent.length > 0 || currentHeading !== null) {
+    sections.push({
+      heading: currentHeading,
+      headingLevel: currentLevel,
+      content: currentContent.join('\n').trim(),
+    });
+  }
+
+  // If nothing was parsed, return the whole content as one section
+  if (sections.length === 0 && markdown.trim()) {
+    sections.push({
+      heading: null,
+      headingLevel: 0,
+      content: markdown.trim(),
+    });
+  }
+
+  return sections;
 }
 ```
 
-- [ ] **Step 2: Verify webview TypeScript compiles**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx tsc --noEmit`
-
-Expected: No type errors
-
-- [ ] **Step 3: Commit**
+- [ ] **Step 2: Commit**
 
 ```bash
 git add webview/src/components/dialogs/PlanViewer.tsx
-git commit -m "feat(permissions): add PlanViewer component for plan mode rendering"
+git commit -m "feat(permissions): add basic PlanViewer component for plan mode"
 ```
 
 ---
 
-## Task 7: Wire PermissionHandler into Extension Host
+## Task 9: Integrate Permissions into Webview App.tsx
 
 **Files:**
-- Modify: `src/extension.ts`
+- Edit: `webview/src/App.tsx`
 
-This task wires the `PermissionHandler` into the extension lifecycle:
-1. Creates a `PermissionHandler` instance on activation
-2. Registers it to handle `can_use_tool` and `control_cancel_request` from the ControlRouter
-3. Connects it to WebviewBridges as they are created
-4. Reads `initialPermissionMode` from VS Code settings and passes it to CLI on spawn
-5. Updates the mode when CLI sends `system.init` or `system.status` with `permissionMode`
+Wire the PermissionDialog, PermissionModeIndicator, and usePermissions hook into the main webview layout.
 
-- [ ] **Step 1: Update src/extension.ts to create and wire PermissionHandler**
+- [ ] **Step 1: Update App.tsx with permission UI**
 
-Add to the `activate` function, after the existing WebviewProvider and Bridge setup:
-
-```typescript
-import { PermissionHandler } from './permissions/permissionHandler';
-
-// Inside activate():
-
-// Create permission handler
-const permissionHandler = new PermissionHandler();
-context.subscriptions.push(permissionHandler);
-
-// Read initial permission mode from settings
-const config = vscode.workspace.getConfiguration('openclaudeCode');
-const initialMode = config.get<string>('initialPermissionMode', 'default');
-if (initialMode && ['default', 'plan', 'acceptEdits', 'bypassPermissions', 'dontAsk'].includes(initialMode)) {
-  permissionHandler.setPermissionMode(initialMode as any);
-}
-
-// --- Hook into ControlRouter (Story 2 provides this) ---
-// When ControlRouter receives a control_request with subtype 'can_use_tool':
-//   controlRouter.on('can_use_tool', (req) => permissionHandler.handlePermissionRequest(req));
-//
-// When ControlRouter receives a control_cancel_request:
-//   controlRouter.on('control_cancel_request', (req) => permissionHandler.handleCancelRequest(req));
-//
-// When ProcessManager spawns the CLI and provides a stdin writer:
-//   processManager.on('stdin_ready', (writer) => permissionHandler.setStdinWriter(writer));
-//   processManager.on('exit', () => permissionHandler.clearStdinWriter());
-
-// --- Hook into WebviewBridge (Story 3 provides this) ---
-// When a new WebviewBridge is created:
-//   const bridgeDisposable = permissionHandler.registerBridge(bridge);
-//   context.subscriptions.push(bridgeDisposable);
-
-// --- Hook into init/status messages from CLI ---
-// When CLI sends system.init message:
-//   if (initMsg.permissionMode) permissionHandler.setPermissionMode(initMsg.permissionMode);
-// When CLI sends system.status message:
-//   if (statusMsg.permissionMode) permissionHandler.setPermissionMode(statusMsg.permissionMode);
-```
-
-The above comments show the integration points. The actual wiring depends on how the ControlRouter and ProcessManager are structured from Stories 2/3. The pattern is:
-
-```typescript
-// Example full wiring (actual code after Story 2/3 are implemented):
-
-// ControlRouter integration
-controlRouter.registerHandler('can_use_tool', (controlRequest) => {
-  permissionHandler.handlePermissionRequest(controlRequest);
-});
-
-controlRouter.registerCancelHandler((cancelRequest) => {
-  permissionHandler.handleCancelRequest(cancelRequest);
-});
-
-// ProcessManager integration
-processManager.onStdinReady((writer) => {
-  permissionHandler.setStdinWriter(writer);
-});
-
-processManager.onExit(() => {
-  permissionHandler.clearStdinWriter();
-});
-
-// WebviewBridge integration (for each bridge created)
-function onBridgeCreated(bridge: WebviewBridge) {
-  const sub = permissionHandler.registerBridge(bridge);
-  context.subscriptions.push(sub);
-}
-
-// CLI message integration (in the NDJSON message handler)
-function handleCliMessage(msg: StdoutMessage) {
-  if (msg.type === 'system' && msg.subtype === 'init') {
-    if (msg.permissionMode) {
-      permissionHandler.setPermissionMode(msg.permissionMode);
-    }
-  }
-  if (msg.type === 'system' && msg.subtype === 'status') {
-    if (msg.permissionMode) {
-      permissionHandler.setPermissionMode(msg.permissionMode);
-    }
-  }
-}
-```
-
-- [ ] **Step 2: Verify TypeScript compiles**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit`
-
-Expected: No type errors
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add src/extension.ts
-git commit -m "feat(permissions): wire PermissionHandler into extension lifecycle"
-```
-
----
-
-## Task 8: Wire Permission Components into Webview App
-
-**Files:**
-- Modify: `webview/src/App.tsx`
-
-This task integrates the permission components into the webview's React tree:
-1. Uses `usePermissions` hook to manage state
-2. Renders `PermissionDialog` when there is a pending request
-3. Renders `PermissionModeIndicator` in the footer area
-4. Passes initial permission mode from `init_state`
-
-- [ ] **Step 1: Update webview/src/App.tsx to include permission components**
-
-Add the permission system to the existing App component:
+Replace the full contents of `webview/src/App.tsx`:
 
 ```tsx
+// webview/src/App.tsx
 import { useState, useEffect } from 'react';
 import { vscode } from './vscode';
 import { usePermissions } from './hooks/usePermissions';
 import { PermissionDialog } from './components/dialogs/PermissionDialog';
 import { PermissionModeIndicator } from './components/input/PermissionModeIndicator';
+import type { PermissionMode } from './components/input/ModeSelector';
 
 function App() {
-  const [initState, setInitState] = useState<{
-    permissionMode?: string;
-  } | null>(null);
+  const { currentRequest, dismissRequest, pendingCount } = usePermissions();
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
 
-  // Listen for init_state to get initial permission mode
+  // Listen for permission mode updates from the extension host.
+  // Mode comes through cli_output system messages (init and status subtypes).
   useEffect(() => {
     const handler = (event: MessageEvent) => {
-      if (event.data.type === 'init_state') {
-        setInitState(event.data);
+      const message = event.data;
+      if (message.type !== 'cli_output' || !message.data) return;
+
+      const data = message.data;
+      if (
+        data.type === 'system' &&
+        (data.subtype === 'status' || data.subtype === 'init') &&
+        data.permissionMode
+      ) {
+        setPermissionMode(data.permissionMode as PermissionMode);
       }
     };
+
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
   }, []);
-
-  const {
-    currentRequest,
-    pendingCount,
-    permissionMode,
-    allow,
-    deny,
-    alwaysAllow,
-    setPermissionMode,
-  } = usePermissions(initState?.permissionMode as any);
 
   return (
     <div className="flex flex-col h-screen bg-vscode-bg text-vscode-fg">
@@ -1391,7 +1593,7 @@ function App() {
         <span className="text-xs opacity-50">v0.1.0</span>
       </div>
 
-      {/* Message area (placeholder — Story 4 builds the real chat UI) */}
+      {/* Message area (placeholder — full implementation in Story 4) */}
       <div className="flex-1 flex items-center justify-center">
         <div className="text-center opacity-50">
           <p className="text-lg font-semibold mb-2">OpenClaude</p>
@@ -1410,29 +1612,27 @@ function App() {
             disabled
           />
         </div>
-        {/* Context footer with permission mode indicator */}
-        <div className="flex items-center justify-between mt-1.5 px-1">
-          <div className="flex items-center gap-2">
-            <PermissionModeIndicator
-              mode={permissionMode}
-              onModeChange={setPermissionMode}
-            />
-          </div>
-          <span className="text-[10px] text-vscode-fg/30">
-            {permissionMode === 'plan' ? 'Plan mode active' : ''}
-          </span>
+
+        {/* Footer: permission mode indicator + version */}
+        <div className="flex items-center justify-between mt-1.5 px-0.5">
+          <PermissionModeIndicator mode={permissionMode} />
+          <span className="text-[10px] opacity-25">OpenClaude v0.1.0</span>
         </div>
       </div>
 
-      {/* Permission dialog overlay */}
+      {/* Permission Dialog overlay — shown when CLI requests tool permission */}
       {currentRequest && (
         <PermissionDialog
           request={currentRequest}
-          pendingCount={pendingCount}
-          onAllow={allow}
-          onDeny={deny}
-          onAlwaysAllow={alwaysAllow}
+          onDismiss={dismissRequest}
         />
+      )}
+
+      {/* Pending permission count badge (when multiple are queued) */}
+      {pendingCount > 1 && (
+        <div className="fixed bottom-20 right-4 bg-yellow-500 text-black text-[10px] font-bold rounded-full w-5 h-5 flex items-center justify-center z-40">
+          {pendingCount}
+        </div>
       )}
     </div>
   );
@@ -1441,373 +1641,372 @@ function App() {
 export default App;
 ```
 
-- [ ] **Step 2: Build the webview**
+- [ ] **Step 2: Verify webview builds**
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx vite build`
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx vite build 2>&1 | tail -5`
 
 Expected: Build succeeds
-
-- [ ] **Step 3: Build the extension**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npm run build`
-
-Expected: Both extension and webview build successfully
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add webview/src/App.tsx
-git commit -m "feat(permissions): wire PermissionDialog and mode indicator into webview App"
-```
-
----
-
-## Task 9: Permission Mode CLI Flag Integration
-
-**Files:**
-- Modify: `src/permissions/permissionHandler.ts` (add getCliFlags method)
-
-The permission mode must be passed to the CLI on spawn via `--permission-mode <mode>`. This task adds a helper that the ProcessManager (Story 2) calls when constructing spawn arguments.
-
-- [ ] **Step 1: Add getCliFlags method to PermissionHandler**
-
-Add this method to the `PermissionHandler` class:
-
-```typescript
-  /**
-   * Get CLI spawn flags for the current permission mode.
-   * Called by ProcessManager when constructing the spawn command.
-   *
-   * Returns an array of flags, e.g. ['--permission-mode', 'plan'].
-   * Returns empty array for 'default' mode (CLI's own default).
-   */
-  getCliFlags(): string[] {
-    if (this.currentMode === 'default') {
-      return [];
-    }
-    return ['--permission-mode', this.currentMode];
-  }
-
-  /**
-   * Get the initial permission mode from VS Code settings.
-   * Static method — can be called before PermissionHandler is instantiated.
-   */
-  static getInitialModeFromSettings(): PermissionMode {
-    const config = vscode.workspace.getConfiguration('openclaudeCode');
-    const mode = config.get<string>('initialPermissionMode', 'default');
-
-    const validModes: PermissionMode[] = [
-      'default', 'plan', 'acceptEdits', 'bypassPermissions', 'dontAsk',
-    ];
-
-    if (validModes.includes(mode as PermissionMode)) {
-      // Gate bypassPermissions behind the danger setting
-      if (mode === 'bypassPermissions') {
-        const allowBypass = config.get<boolean>('allowDangerouslySkipPermissions', false);
-        if (!allowBypass) {
-          return 'default';
-        }
-      }
-      return mode as PermissionMode;
-    }
-
-    return 'default';
-  }
-```
-
-- [ ] **Step 2: Verify TypeScript compiles**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit`
-
-Expected: No type errors
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add src/permissions/permissionHandler.ts
-git commit -m "feat(permissions): add CLI flag generation and settings-based initial mode"
+git add webview/src/App.tsx
+git commit -m "feat(permissions): integrate PermissionDialog and ModeIndicator into App"
 ```
 
 ---
 
-## Task 10: Auto Mode & Bypass Mode Handling
+## Task 10: Wire PermissionHandler into Extension Activation
 
 **Files:**
-- Modify: `src/permissions/permissionHandler.ts` (already handled in Task 2)
-- Verify: The bypass/auto logic is correct
+- Edit: `src/extension.ts`
+- Edit: `src/webview/webviewProvider.ts`
 
-This task verifies and documents the auto mode and bypass mode behavior that was implemented in Task 2's `handlePermissionRequest` method.
+Connect the PermissionHandler to the extension lifecycle: create it during activation, and expose a hook for connecting it to WebviewBridge instances.
 
-- [ ] **Step 1: Verify auto mode (bypassPermissions) behavior**
+- [ ] **Step 1: Add onBridgeCreated event to OpenClaudeWebviewProvider**
 
-In `permissionHandler.ts`, the `handlePermissionRequest` method already includes:
+In `src/webview/webviewProvider.ts`, add an EventEmitter so external modules can react when a new WebviewBridge is created:
 
 ```typescript
-// In auto mode (bypassPermissions), immediately allow without showing dialog
-if (this.currentMode === 'bypassPermissions') {
-  this.sendPermissionResponse(requestId, {
-    behavior: 'allow',
-    toolUseID: request.tool_use_id,
-    decisionClassification: 'user_temporary',
-  });
-  return;
-}
+// Add these to the class:
+private readonly _onBridgeCreated = new vscode.EventEmitter<WebviewBridge>();
+public readonly onBridgeCreated = this._onBridgeCreated.event;
+
+// In resolveWebviewView() and createPanel(), after creating a WebviewBridge instance:
+// this._onBridgeCreated.fire(bridge);
+
+// In the dispose method, add:
+// this._onBridgeCreated.dispose();
 ```
 
-This means:
-- No dialog shown
-- All tool_use requests auto-accepted
-- Response sent immediately back to CLI
-
-- [ ] **Step 2: Verify bypass mode gating**
-
-In `handleSetPermissionMode`, bypass mode is gated:
+- [ ] **Step 2: Import and instantiate PermissionHandler in extension.ts**
 
 ```typescript
-if (mode === 'bypassPermissions') {
-  const config = vscode.workspace.getConfiguration('openclaudeCode');
-  const allowBypass = config.get<boolean>('allowDangerouslySkipPermissions', false);
-  if (!allowBypass) {
-    vscode.window.showWarningMessage(
-      'Bypass mode requires enabling "openclaudeCode.allowDangerouslySkipPermissions" in settings.',
+// src/extension.ts — updated
+import * as vscode from 'vscode';
+import { OpenClaudeWebviewProvider } from './webview/webviewProvider';
+import { PermissionHandler } from './permissions/permissionHandler';
+
+export function activate(context: vscode.ExtensionContext) {
+  console.log('OpenClaude VS Code extension activated');
+
+  // Create the permission handler
+  const permissionHandler = new PermissionHandler(context);
+  context.subscriptions.push(permissionHandler);
+
+  const provider = new OpenClaudeWebviewProvider(context.extensionUri);
+
+  // Register sidebar webview providers
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider('openclaudeSidebarSecondary', provider),
+  );
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider('openclaudeSidebar', provider),
+  );
+
+  // Connect permission handler to new webview bridges
+  context.subscriptions.push(
+    provider.onBridgeCreated((bridge) => {
+      permissionHandler.connectBridge(bridge);
+    }),
+  );
+
+  // Open in New Tab
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.editor.open', () => {
+      provider.createPanel();
+    }),
+  );
+
+  // Open (last location)
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.editor.openLast', () => {
+      provider.createPanel();
+    }),
+  );
+
+  // Open in Primary Editor
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.primaryEditor.open', () => {
+      provider.createPanel();
+    }),
+  );
+
+  // Register remaining commands as no-ops for now
+  const noopCommands = [
+    'openclaude.window.open',
+    'openclaude.sidebar.open',
+    'openclaude.terminal.open',
+    'openclaude.terminal.open.keyboard',
+    'openclaude.createWorktree',
+    'openclaude.newConversation',
+    'openclaude.focus',
+    'openclaude.blur',
+    'openclaude.insertAtMention',
+    'openclaude.insertAtMentioned',
+    'openclaude.acceptProposedDiff',
+    'openclaude.rejectProposedDiff',
+    'openclaude.showLogs',
+    'openclaude.openWalkthrough',
+    'openclaude.update',
+    'openclaude.installPlugin',
+    'openclaude.logout',
+  ];
+
+  for (const id of noopCommands) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(id, () => {
+        vscode.window.showInformationMessage('OpenClaude: Coming soon!');
+      }),
     );
-    return;
   }
 }
-```
 
-And in `getInitialModeFromSettings`:
-
-```typescript
-if (mode === 'bypassPermissions') {
-  const allowBypass = config.get<boolean>('allowDangerouslySkipPermissions', false);
-  if (!allowBypass) {
-    return 'default';
-  }
+export function deactivate() {
+  console.log('OpenClaude VS Code extension deactivated');
 }
 ```
 
-This means:
-- User cannot enter bypass mode unless `openclaudeCode.allowDangerouslySkipPermissions` is `true`
-- If the setting is `false`, a warning is shown and mode stays unchanged
-- If `initialPermissionMode` is set to `bypassPermissions` but the danger setting is off, falls back to `default`
+- [ ] **Step 3: Commit**
 
-- [ ] **Step 3: Verify dontAsk mode behavior**
-
-In `handlePermissionRequest`:
-
-```typescript
-if (this.currentMode === 'dontAsk') {
-  this.sendPermissionResponse(requestId, {
-    behavior: 'deny',
-    message: 'Permission denied: dontAsk mode is active',
-    toolUseID: request.tool_use_id,
-    decisionClassification: 'user_reject',
-  });
-  return;
-}
+```bash
+git add src/extension.ts src/webview/webviewProvider.ts
+git commit -m "feat(permissions): wire PermissionHandler into extension activation lifecycle"
 ```
-
-This means: if CLI sends a permission request in dontAsk mode (meaning the tool was not pre-approved), it gets denied immediately without a dialog.
-
-- [ ] **Step 4: Document the mode behavior matrix**
-
-| Mode | Dialog shown? | Default behavior | CLI flag |
-|---|---|---|---|
-| `default` | Yes | Prompts for dangerous tools | `--permission-mode default` (or omitted) |
-| `plan` | No (plan viewer instead) | No tool execution | `--permission-mode plan` |
-| `acceptEdits` | Yes (for non-edit tools) | Auto-accept file edits | `--permission-mode acceptEdits` |
-| `bypassPermissions` | No | All auto-allowed | `--permission-mode bypassPermissions` |
-| `dontAsk` | No | Deny if not pre-approved | `--permission-mode dontAsk` |
-
-Note: In `acceptEdits` mode, the CLI itself handles auto-accepting edits. It only sends `can_use_tool` to the extension for non-edit tools that still need approval. So the extension shows the dialog for those.
-
-No code changes needed — this task is verification only.
-
-- [ ] **Step 5: Commit (no-op, verification only)**
-
-No commit needed for this task.
 
 ---
 
-## Task 11: control_cancel_request Integration
+## Task 11: Bypass Mode Setting in package.json
 
 **Files:**
-- Verify: `src/permissions/permissionHandler.ts` (already implemented in Task 2)
-- Verify: `webview/src/hooks/usePermissions.ts` (already handles `cancel_request`)
+- Edit: `package.json`
 
-This task verifies the cancel flow works end-to-end.
+Ensure the `allowDangerouslySkipPermissions` setting is declared in `contributes.configuration` so VS Code recognizes it.
 
-- [ ] **Step 1: Verify extension host cancel handling**
+- [ ] **Step 1: Verify or add the bypass setting**
 
-In `permissionHandler.ts`, `handleCancelRequest` already:
-1. Removes the request from `pendingRequests` map
-2. Sends `cancel_request` postMessage to all bridges
+Search `package.json` for `allowDangerouslySkipPermissions`. If missing, add to `contributes.configuration.properties`:
 
-```typescript
-handleCancelRequest(cancelRequest: SDKControlCancelRequest): void {
-  const requestId = cancelRequest.request_id;
-  if (this.pendingRequests.has(requestId)) {
-    this.pendingRequests.delete(requestId);
-    const cancelMsg: CancelRequestMessage = { type: 'cancel_request', requestId };
-    for (const bridge of this.bridges) {
-      bridge.postMessage(cancelMsg);
-    }
-  }
+```json
+"openclaudeCode.allowDangerouslySkipPermissions": {
+  "type": "boolean",
+  "default": false,
+  "description": "Allow the 'Bypass Permissions' mode which skips all tool permission checks. Use with extreme caution — tools will execute without confirmation.",
+  "scope": "window"
 }
 ```
 
-- [ ] **Step 2: Verify webview cancel handling**
+- [ ] **Step 2: Commit**
 
-In `usePermissions.ts`, the message handler already processes `cancel_request`:
-
-```typescript
-case 'cancel_request':
-  setRequests((prev) => prev.filter((r) => r.requestId !== msg.requestId));
-  break;
+```bash
+git add package.json
+git commit -m "feat(permissions): declare allowDangerouslySkipPermissions setting"
 ```
-
-This removes the canceled request from the queue, causing the `PermissionDialog` to:
-- Dismiss if it was the active dialog (and show the next one if queued)
-- Remove from queue silently if it wasn't the active dialog
-
-- [ ] **Step 3: Verify CLI exit cleans up all pending requests**
-
-In `permissionHandler.ts`, `clearStdinWriter` calls `rejectAllPending`:
-
-```typescript
-clearStdinWriter(): void {
-  this.writeToStdin = null;
-  this.rejectAllPending('CLI process exited');
-}
-```
-
-And `rejectAllPending` sends `cancel_request` for each pending request:
-
-```typescript
-private rejectAllPending(reason: string): void {
-  for (const [requestId, pending] of this.pendingRequests) {
-    const cancelMsg: CancelRequestMessage = { type: 'cancel_request', requestId };
-    for (const bridge of this.bridges) {
-      bridge.postMessage(cancelMsg);
-    }
-  }
-  this.pendingRequests.clear();
-}
-```
-
-No code changes needed.
-
-- [ ] **Step 4: Commit (no-op, verification only)**
-
-No commit needed for this task.
 
 ---
 
-## Task 12: End-to-End Verification
+## Task 12: CLI Spawn Flag Integration Note
 
-- [ ] **Step 1: Full build**
+**Files:**
+- No new files (integration point for Story 2 ProcessManager)
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npm run build`
+When the ProcessManager (Story 2) spawns the CLI, it must pass `--permission-mode` as a flag. The PermissionHandler exposes `getMode(): PermissionMode` for this purpose.
 
-Expected: Build completes with no errors
+- [ ] **Step 1: Document the integration pattern**
 
-- [ ] **Step 2: Verify all new files exist**
+In `src/process/processManager.ts` (when it exists from Story 2), the spawn method should include:
+
+```typescript
+// In ProcessManager.spawn():
+const permMode = this.permissionHandler.getMode();
+const args = [
+  '--output-format', 'stream-json',
+  '--input-format', 'stream-json',
+  '--permission-mode', permMode,
+  // ... other flags
+];
+```
+
+And the ProcessManager should call `permissionHandler.setStdinWriter(writer)` after spawning, so the PermissionHandler can write control_response messages to the CLI:
+
+```typescript
+// After spawn:
+const writer = (msg: unknown) => {
+  const line = JSON.stringify(msg) + '\n';
+  childProcess.stdin.write(line);
+};
+permissionHandler.setStdinWriter(writer);
+```
+
+No code to commit in this task — it is documentation for the Story 2 integration.
+
+---
+
+## Task 13: End-to-End Verification
+
+- [ ] **Step 1: Extension host compilation**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && node esbuild.config.mjs 2>&1`
+
+Expected: `Extension built successfully`
+
+- [ ] **Step 2: Webview compilation**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx vite build 2>&1 | tail -5`
+
+Expected: Build succeeds
+
+- [ ] **Step 3: TypeScript type-check (extension host)**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit 2>&1 | tail -20`
+
+Expected: No type errors in permission-related files
+
+- [ ] **Step 4: TypeScript type-check (webview)**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx tsc --noEmit 2>&1 | tail -20`
+
+Expected: No type errors in permission-related files
+
+- [ ] **Step 5: Verify all files exist**
 
 Run:
 ```bash
 ls -la src/permissions/permissionHandler.ts \
-       webview/src/hooks/usePermissions.ts \
+       src/permissions/permissionRules.ts \
+       src/permissions/permissionRouter.ts \
        webview/src/components/dialogs/PermissionDialog.tsx \
        webview/src/components/dialogs/PlanViewer.tsx \
-       webview/src/components/input/PermissionModeIndicator.tsx
+       webview/src/components/input/PermissionModeIndicator.tsx \
+       webview/src/components/input/ModeSelector.tsx \
+       webview/src/hooks/usePermissions.ts
 ```
 
-Expected: All 5 files exist
+Expected: All 8 files exist
 
-- [ ] **Step 3: TypeScript compilation check (no emit)**
+- [ ] **Step 6: Manual smoke test in Extension Development Host**
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit`
+1. Press F5 to launch the Extension Development Host
+2. Open the OpenClaude sidebar
+3. Verify the PermissionModeIndicator shows "Default" (blue shield) in the footer
+4. Click the indicator — ModeSelector dropdown should appear with 5 options
+5. Click "Plan" — indicator changes to purple "Plan"
+6. Click "Accept Edits" — indicator changes to green "Accept Edits"
+7. Click "Bypass" — should show VS Code warning about the setting not being enabled
+8. Enable `openclaudeCode.allowDangerouslySkipPermissions` in settings
+9. Click "Bypass" again — should succeed, indicator changes to red "Bypass"
+10. Click "Default" to return to normal mode
 
-Expected: No type errors
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode/webview && npx tsc --noEmit`
-
-Expected: No type errors
-
-- [ ] **Step 4: Package as .vsix**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx @vscode/vsce package --no-dependencies --allow-missing-repository`
-
-Expected: Produces .vsix with no errors
-
-- [ ] **Step 5: Manual verification in VS Code**
-
-Install the extension and verify:
-1. Open OpenClaude in sidebar — permission mode indicator visible in footer
-2. Click the mode indicator — dropdown appears with 5 modes
-3. Select "Plan" mode — indicator changes to purple "Plan"
-4. Select "Bypass" mode without the danger setting — warning message appears
-5. Enable `openclaudeCode.allowDangerouslySkipPermissions` — bypass mode works
-
-Note: Full end-to-end permission dialog testing requires a running CLI (Stories 2+4), so the dialog will only be testable with a mock or after those stories land.
-
-- [ ] **Step 6: Commit final verification**
+- [ ] **Step 7: Final commit (if any uncommitted changes)**
 
 ```bash
 git add -A
-git commit -m "chore: Story 7 complete — permission system with dialog, mode indicator, plan viewer"
+git commit -m "feat(permissions): Story 7 complete — permission system and dialogs"
 ```
 
 ---
 
-## Summary
+## Acceptance Criteria Checklist
 
-| Task | What it does | Key files |
-|---|---|---|
-| 1 | Extend PostMessage types with rich permission data | `src/webview/types.ts` |
-| 2 | PermissionHandler (extension host orchestrator) | `src/permissions/permissionHandler.ts` |
-| 3 | usePermissions React hook (webview state) | `webview/src/hooks/usePermissions.ts` |
-| 4 | PermissionDialog component (webview modal) | `webview/src/components/dialogs/PermissionDialog.tsx` |
-| 5 | PermissionModeIndicator component (footer badge) | `webview/src/components/input/PermissionModeIndicator.tsx` |
-| 6 | PlanViewer component (plan mode rendering) | `webview/src/components/dialogs/PlanViewer.tsx` |
-| 7 | Wire PermissionHandler into extension host | `src/extension.ts` |
-| 8 | Wire permission components into webview App | `webview/src/App.tsx` |
-| 9 | CLI flag generation for permission mode | `src/permissions/permissionHandler.ts` |
-| 10 | Verify auto/bypass/dontAsk mode behavior | (verification only) |
-| 11 | Verify control_cancel_request handling | (verification only) |
-| 12 | End-to-end build + package + manual test | `.vsix` output |
+| # | Criteria | Implementation | Task |
+|---|---|---|---|
+| 1 | When CLI sends `control_request`, show PermissionDialog in webview | `PermissionHandler.handlePermissionRequest()` -> bridge.postMessage -> `usePermissions` hook -> `PermissionDialog` | T2, T5, T6 |
+| 2 | Dialog shows: tool name, tool input (formatted), Allow/Deny/Always Allow | `PermissionDialog.tsx` with `formatToolInput()` for smart formatting, three action buttons with keyboard shortcuts | T5 |
+| 3 | "Always Allow" adds to permission rules | `handleWebviewPermissionResponse()` -> `PermissionRules.add()` + sends `updatedPermissions` to CLI | T1, T2 |
+| 4 | Permission mode indicator in footer | `PermissionModeIndicator.tsx` in App.tsx footer, color-coded per mode | T7, T9 |
+| 5 | Clicking permission mode shows picker to switch | `ModeSelector.tsx` dropdown opened by PermissionModeIndicator click | T7 |
+| 6 | Permission mode passed as `--permission-mode` flag to CLI | `PermissionHandler.getMode()` called by ProcessManager during spawn (documented in T12) | T12 |
+| 7 | Auto mode: no dialogs, all tool_use auto-accepted | `shouldAutoApprove()` returns true for `bypassPermissions` mode; `acceptEdits` auto-approves file tools | T2 |
+| 8 | Bypass mode: gated behind `allowDangerouslySkipPermissions` setting | `handleWebviewModeChange()` checks VS Code config; shows warning if not enabled | T2, T11 |
+| 9 | Plan mode: CLI sends plan document, rendered in PlanViewer | `PlanViewer.tsx` with section parsing, approve/revise buttons, feedback textarea | T8 |
+| 10 | `control_cancel_request` handling for stale dialogs | `PermissionHandler.handleCancelRequest()` -> bridge.postMessage `cancel_request` -> `usePermissions` removes from queue | T2, T3, T6 |
 
-### Data Flow Summary
+---
+
+## Architecture Diagram
 
 ```
-CLI (stdout)                    Extension Host                     Webview
-─────────────────────────────────────────────────────────────────────────────
+CLI Process (stdout NDJSON)
+  |
+  |-- control_request { subtype: 'can_use_tool', tool_name, input, tool_use_id, ... }
+  |     |
+  |     v
+  |   PermissionRouter.handleControlRequest(message)
+  |     |
+  |     v
+  |   PermissionHandler.handlePermissionRequest(requestId, request)
+  |     |
+  |     +-- shouldAutoApprove(toolName)?
+  |     |     |
+  |     |     yes --> sendAllowResponse() --> writeToStdin() --> CLI stdin
+  |     |     |
+  |     |     no  --> pendingRequests.set(requestId, ...)
+  |     |             bridge.postMessage({ type: 'permission_request', ... })
+  |     |               |
+  |     |               v
+  |     |             WEBVIEW
+  |     |               |
+  |     |             usePermissions() hook adds to queue
+  |     |               |
+  |     |               v
+  |     |             PermissionDialog renders
+  |     |             User clicks: [Deny] / [Always Allow] / [Allow]
+  |     |               |
+  |     |               v
+  |     |             vscode.postMessage({ type: 'permission_response', ... })
+  |     |               |
+  |     |               v
+  |     |             EXTENSION HOST
+  |     |               |
+  |     |             bridge.onMessage('permission_response', ...)
+  |     |               |
+  |     |               v
+  |     |             PermissionHandler.handleWebviewPermissionResponse()
+  |     |               |
+  |     |               +-- allowed + alwaysAllow? --> PermissionRules.add()
+  |     |               |
+  |     |               v
+  |     |             sendAllowResponse() or sendDenyResponse()
+  |     |               |
+  |     |               v
+  |     |             writeToStdin({ type: 'control_response', ... })
+  |     |               |
+  |     |               v
+  |     |             CLI stdin (JSON + newline)
+  |
+  |-- control_cancel_request { request_id }
+  |     |
+  |     v
+  |   PermissionRouter.handleCancelRequest(message)
+  |     --> PermissionHandler.handleCancelRequest(requestId)
+  |           --> pendingRequests.delete(requestId)
+  |           --> bridge.postMessage({ type: 'cancel_request', requestId })
+  |                 --> usePermissions() removes from queue
+  |                 --> PermissionDialog unmounts
+  |
+  |-- control_request { subtype: 'set_permission_mode', mode }
+        |
+        v
+      PermissionRouter.handleControlRequest(message)
+        --> PermissionHandler.handleCliModeChange(request, requestId)
+              --> currentMode = request.mode
+              --> sendControlResponse(requestId, {})  --> CLI stdin
+              --> notifyWebviewModeChange(mode)
+                    --> bridge.postMessage({ type: 'cli_output', data: { ... permissionMode } })
+                          --> App.tsx useEffect updates permissionMode state
+                          --> PermissionModeIndicator re-renders
 
-control_request                 PermissionHandler                  PermissionDialog
-  subtype: can_use_tool  ──→    handlePermissionRequest()  ──→    usePermissions hook
-  tool_name, input, ...         checks mode (auto→allow)           renders modal
-                                stores in pendingRequests
-                                postMessage(permission_request)
 
-                                                                   User clicks
-                                                                   Allow/Deny/Always Allow
-                                                                       │
-control_response         ←──    handlePermissionResponse() ←──    postMessage(permission_response)
-  behavior: allow/deny          builds PermissionResult             behavior, updatedPermissions,
-  updatedPermissions            writes to CLI stdin                  decisionClassification
+WEBVIEW USER ACTIONS:
 
-control_cancel_request   ──→    handleCancelRequest()      ──→    cancel_request message
-  request_id                    removes from pending               filters from queue
-
-User clicks mode badge                                             PermissionModeIndicator
-                                                                   onModeChange(mode)
-                                                                       │
-control_request          ←──    handleSetPermissionMode()  ←──    postMessage(set_permission_mode)
-  subtype: set_permission_mode  gates bypass behind setting
-  mode: ...                     writes to CLI stdin
-                                notifies all bridges
-
-system.init/status       ──→    setPermissionMode()        ──→    permission_mode_changed
-  permissionMode                updates currentMode                updates hook state
+  ModeSelector click --> vscode.postMessage({ type: 'set_permission_mode', mode })
+    --> bridge.onMessage('set_permission_mode', ...)
+    --> PermissionHandler.handleWebviewModeChange(mode)
+          +-- bypass? check allowDangerouslySkipPermissions setting
+          |     no  --> vscode.window.showWarningMessage() --> STOP
+          |     yes --> continue
+          --> currentMode = mode
+          --> writeToStdin({ type: 'control_request', subtype: 'set_permission_mode', mode })
+          --> CLI applies new mode
 ```

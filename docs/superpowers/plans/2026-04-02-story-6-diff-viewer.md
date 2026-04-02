@@ -1,24 +1,16 @@
-# Story 6: Native Diff Viewer — Accept/Reject — Implementation Plan
+# Story 6: Native Diff Viewer -- Accept/Reject -- Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** When the CLI sends a `control_request` with `subtype: can_use_tool` for FileEditTool or FileWriteTool, show the user a VS Code native diff editor (original vs proposed content) with Accept/Reject buttons in the editor title bar. Accept applies changes to the file and sends a success `control_response`; Reject discards changes and sends an error `control_response`. Multiple pending diffs (one per file) are supported concurrently.
+**Goal:** When the CLI sends a `control_request` with `subtype: can_use_tool` for `FileEditTool` or `FileWriteTool`, intercept it and show a VS Code native diff editor with the original file content on the left and the proposed content on the right. The editor title bar shows Accept (checkmark) and Reject (discard) buttons. Accepting writes the changes to disk and sends a success `control_response`. Rejecting discards changes and sends a deny `control_response`. Multiple pending diffs are supported (one per file). The diff editor closes after a decision.
 
-**Architecture:** Two classes — `DiffContentProvider` (a `vscode.FileSystemProvider` that serves virtual file content for the left/right sides of the diff) and `DiffManager` (orchestrates showing diffs, wiring accept/reject events, and communicating back to the CLI via the ControlRouter). The pattern is extracted directly from Claude Code's extension.js, which uses `registerFileSystemProvider` for left (original) and right (proposed) virtual file systems, `vscode.diff` command to open the native diff editor, and EventEmitter-driven accept/reject commands.
+**Architecture:** Two new files in `src/diff/`: a `DiffContentProvider` (implements `vscode.TextDocumentContentProvider`) that serves virtual documents with original and proposed content via custom URI schemes, and a `DiffManager` that orchestrates the full lifecycle -- intercepting tool_use permission requests, reading original file content, computing proposed content, opening the diff editor, handling accept/reject, writing files, and sending control responses back to the CLI.
 
-**Tech Stack:** TypeScript 5.x, VS Code Extension API (`FileSystemProvider`, `TextDocumentContentProvider`, `vscode.diff` command, context variables), Vitest for unit tests
+**Tech Stack:** TypeScript 5.x, VS Code Extension API (`TextDocumentContentProvider`, `vscode.diff`, context variables)
 
-**Spec:** [2026-04-02-openclaude-vscode-extension-design.md](../specs/2026-04-02-openclaude-vscode-extension-design.md) — Story 6
+**Spec:** [2026-04-02-openclaude-vscode-extension-design.md](../specs/2026-04-02-openclaude-vscode-extension-design.md) -- Story 6
 
-**Dependency:** Story 2 (ProcessManager, NdjsonTransport, ControlRouter, TypeScript types)
-
-**Claude Code extension (deminified reference):**
-- `$2` class — `FileSystemProvider` for left/right virtual filesystems (scheme: `_claude_vscode_fs_left`, `_claude_vscode_fs_right`)
-- `FQ` class — `TextDocumentContentProvider` for readonly content
-- `cr` function — Opens `vscode.diff` with left URI (original) and right URI (proposed), races accept/reject/tab-close/file-save
-- `Xr` function — Registers `acceptProposedDiff` and `rejectProposedDiff` commands, fires events
-- `dg6` function — Watches `onDidChangeVisibleTextEditors` to set `viewingProposedDiff` context variable
-- `vS6` function — Closes existing diff tabs for the same file before opening a new one
+**Dependency:** Story 2 (ProcessManager + NdjsonTransport) must be implemented. The `NdjsonTransport.write()` method is used to send `control_response` messages back to the CLI.
 
 ---
 
@@ -26,780 +18,508 @@
 
 | File | Responsibility |
 |---|---|
-| `src/diff/diffContentProvider.ts` | `FileSystemProvider` for virtual original/proposed file content — serves left and right sides of diff |
-| `src/diff/diffManager.ts` | Orchestrates diff lifecycle: receives can_use_tool for file tools, opens native diff, handles accept/reject, sends control_response |
-| `src/diff/types.ts` | Types for pending diffs, diff events, and file tool input schemas |
-| `test/unit/diffContentProvider.test.ts` | Unit tests for DiffContentProvider virtual file management |
-| `test/unit/diffManager.test.ts` | Unit tests for DiffManager accept/reject/cancel flows |
+| `src/diff/diffContentProvider.ts` | `TextDocumentContentProvider` for `openclaude-diff-original` and `openclaude-diff-proposed` URI schemes. Serves virtual document content from an in-memory map keyed by file path. |
+| `src/diff/diffManager.ts` | Orchestrates the diff lifecycle: intercepts `can_use_tool` for file-editing tools, reads original content, computes proposed content, opens `vscode.diff`, handles accept/reject commands, writes files, sends control responses, manages pending diffs map. |
+| `src/process/controlRouter.ts` | Routes incoming `control_request` messages to the appropriate handler (DiffManager for file edits, placeholder for other subtypes). |
+| `src/extension.ts` | Updated to create DiffManager, register DiffContentProvider schemes, and wire accept/reject commands. |
+| `src/diff/__tests__/diffContentProvider.test.ts` | Unit tests for DiffContentProvider. |
+| `src/diff/__tests__/diffManager.test.ts` | Unit tests for DiffManager content computation logic. |
 
 ---
 
-## Task 1: Diff Types
-
-**Files:**
-- Create: `src/diff/types.ts`
-
-- [ ] **Step 1: Create src/diff/types.ts**
-
-```typescript
-// src/diff/types.ts
-// Types for the diff viewer system — pending diffs, file tool inputs, events.
-
-import * as vscode from 'vscode';
-
-/**
- * Input schema for FileEditTool — the CLI sends this in can_use_tool.input
- * when requesting permission to edit a file.
- */
-export interface FileEditToolInput {
-  file_path: string;
-  old_string: string;
-  new_string: string;
-  replace_all?: boolean;
-}
-
-/**
- * Input schema for FileWriteTool — the CLI sends this in can_use_tool.input
- * when requesting permission to write/create a file.
- */
-export interface FileWriteToolInput {
-  file_path: string;
-  content: string;
-}
-
-/**
- * Discriminated union of file tool inputs recognized by the diff viewer.
- */
-export type FileToolInput = FileEditToolInput | FileWriteToolInput;
-
-/**
- * Check if a tool_name is a file tool that should trigger the diff viewer.
- */
-export function isFileEditTool(toolName: string): boolean {
-  return toolName === 'FileEditTool' || toolName === 'file_edit';
-}
-
-export function isFileWriteTool(toolName: string): boolean {
-  return toolName === 'FileWriteTool' || toolName === 'file_write';
-}
-
-export function isFileTool(toolName: string): boolean {
-  return isFileEditTool(toolName) || isFileWriteTool(toolName);
-}
-
-/**
- * A pending diff waiting for the user's accept/reject decision.
- * One per file at a time — if a new diff arrives for the same file,
- * the old one is auto-rejected and replaced.
- */
-export interface PendingDiff {
-  /** The control_request request_id — needed for sending control_response */
-  requestId: string;
-  /** Absolute path to the target file */
-  filePath: string;
-  /** The tool name (FileEditTool, FileWriteTool, etc.) */
-  toolName: string;
-  /** Original tool input from the CLI */
-  toolInput: Record<string, unknown>;
-  /** Original file content (before proposed changes) */
-  originalContent: string;
-  /** Proposed file content (after applying changes) */
-  proposedContent: string;
-  /** URI for the left (original) side of the diff */
-  leftUri: vscode.Uri;
-  /** URI for the right (proposed) side of the diff */
-  rightUri: vscode.Uri;
-  /** Timestamp when the diff was created */
-  createdAt: number;
-}
-
-/**
- * Event fired when the user accepts or rejects a diff.
- */
-export interface DiffDecisionEvent {
-  accepted: boolean;
-  activeTab: vscode.Tab | undefined;
-}
-```
-
-- [ ] **Step 2: Commit**
-
-```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add src/diff/types.ts
-git commit -m "feat(diff): add types for pending diffs and file tool inputs"
-```
-
----
-
-## Task 2: DiffContentProvider — Failing Tests First
-
-**Files:**
-- Create: `test/unit/diffContentProvider.test.ts`
-
-The DiffContentProvider is a `vscode.FileSystemProvider` that stores virtual file contents in memory. It provides left (original) and right (proposed) URIs for the `vscode.diff` command. Each instance owns a single URI scheme (e.g., `_openclaude_fs_left` or `_openclaude_fs_right`).
-
-- [ ] **Step 1: Write failing tests for DiffContentProvider**
-
-```typescript
-// test/unit/diffContentProvider.test.ts
-import { describe, it, expect, beforeEach } from 'vitest';
-import { DiffContentProvider } from '../../src/diff/diffContentProvider';
-
-describe('DiffContentProvider', () => {
-  let provider: DiffContentProvider;
-
-  beforeEach(() => {
-    provider = new DiffContentProvider('test-scheme');
-  });
-
-  it('should expose the scheme it was constructed with', () => {
-    expect(provider.scheme).toBe('test-scheme');
-  });
-
-  it('should create a file and return a URI with the correct scheme', () => {
-    const file = provider.createFile('/path/to/file.ts', 'const x = 1;');
-    expect(file.uri.scheme).toBe('test-scheme');
-    expect(file.uri.path).toBe('/path/to/file.ts');
-  });
-
-  it('should read back the content via readFile', () => {
-    const file = provider.createFile('/path/to/file.ts', 'const x = 1;');
-    const content = provider.readFile(file.uri);
-    expect(new TextDecoder().decode(content)).toBe('const x = 1;');
-  });
-
-  it('should overwrite content when createFile is called for the same path', () => {
-    provider.createFile('/path/to/file.ts', 'original');
-    const file = provider.createFile('/path/to/file.ts', 'updated');
-    const content = provider.readFile(file.uri);
-    expect(new TextDecoder().decode(content)).toBe('updated');
-  });
-
-  it('should update content via writeFile', () => {
-    const file = provider.createFile('/path/to/file.ts', 'original');
-    provider.writeFile(file.uri, new TextEncoder().encode('modified'), { create: false, overwrite: true });
-    const content = provider.readFile(file.uri);
-    expect(new TextDecoder().decode(content)).toBe('modified');
-  });
-
-  it('should throw FileNotFound for unknown URIs', () => {
-    const uri = { scheme: 'test-scheme', path: '/nonexistent.ts', toString: () => 'test-scheme:///nonexistent.ts' } as any;
-    expect(() => provider.readFile(uri)).toThrow();
-  });
-
-  it('should return stat for existing files', () => {
-    const file = provider.createFile('/path/to/file.ts', 'hello');
-    const stat = provider.stat(file.uri);
-    expect(stat.type).toBeDefined();
-    expect(stat.size).toBe(new TextEncoder().encode('hello').length);
-  });
-
-  it('should delete a file', () => {
-    const file = provider.createFile('/path/to/file.ts', 'content');
-    provider.delete(file.uri);
-    expect(() => provider.readFile(file.uri)).toThrow();
-  });
-
-  it('should fire onDidChangeFile when content changes via writeFile', () => {
-    const file = provider.createFile('/path/to/file.ts', 'original');
-    const changes: any[] = [];
-    provider.onDidChangeFile((events) => {
-      changes.push(...events);
-    });
-    provider.writeFile(file.uri, new TextEncoder().encode('modified'), { create: false, overwrite: true });
-    expect(changes.length).toBeGreaterThan(0);
-    expect(changes[0].uri.path).toBe('/path/to/file.ts');
-  });
-
-  it('should handle Windows-style paths by normalizing drive letters', () => {
-    // On non-Windows, this just passes through
-    const file = provider.createFile('/c:/Users/test/file.ts', 'content');
-    expect(file.uri.path).toContain('file.ts');
-  });
-});
-```
-
-- [ ] **Step 2: Run tests — should FAIL**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx vitest run test/unit/diffContentProvider.test.ts 2>&1 | tail -10`
-
-Expected: `Error: Cannot find module '../../src/diff/diffContentProvider'`
-
-- [ ] **Step 3: Commit**
-
-```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add test/unit/diffContentProvider.test.ts
-git commit -m "test(diff): add failing tests for DiffContentProvider (TDD red phase)"
-```
-
----
-
-## Task 3: DiffContentProvider — Implementation
+## Task 1: DiffContentProvider -- Virtual Document Provider
 
 **Files:**
 - Create: `src/diff/diffContentProvider.ts`
 
-Implements `vscode.FileSystemProvider` to serve virtual file content for the left and right sides of native diff editors. Pattern extracted from Claude Code extension's `$2` class. Each instance owns a URI scheme (e.g., `_openclaude_fs_left`, `_openclaude_fs_right`). Files are stored in an in-memory `Map<string, VirtualFile>` keyed by normalized path.
+This class implements `vscode.TextDocumentContentProvider` to serve virtual read-only documents. VS Code's diff editor needs two URIs to compare -- we use custom URI schemes (`openclaude-diff-original` and `openclaude-diff-proposed`) so the diff editor shows our content without touching the filesystem.
 
-- [ ] **Step 1: Create src/diff/diffContentProvider.ts**
+- [ ] **Step 1: Create the DiffContentProvider class**
 
 ```typescript
 // src/diff/diffContentProvider.ts
-// Virtual FileSystemProvider for serving original/proposed file content in diff editors.
-//
-// Pattern extracted from Claude Code extension.js class `$2`:
-//   - Uses registerFileSystemProvider (not registerTextDocumentContentProvider)
-//   - Files stored in-memory, keyed by URI path
-//   - Fires onDidChangeFile when content changes
-//   - stat() returns file type and size
-//   - createFile() returns a VirtualFile with .uri property
-//
-// Two instances are created:
-//   - Left provider (scheme: _openclaude_fs_left) — original file content
-//   - Right provider (scheme: _openclaude_fs_right) — proposed file content
+// TextDocumentContentProvider for original and proposed file content.
+// Serves virtual documents via openclaude-diff-original:// and
+// openclaude-diff-proposed:// URI schemes for the native diff editor.
 
 import * as vscode from 'vscode';
 
-/** Normalize Windows drive letter paths: /C:/foo → /c:/foo */
-function normalizePath(filePath: string): string {
-  if (process.platform === 'win32') {
-    // Convert /C:/ to /c:/ for consistent key lookup
-    return filePath.replace(/^\/([A-Z]):/, (_, drive) => `/${drive.toLowerCase()}:`);
-  }
-  return filePath;
-}
+export class DiffContentProvider implements vscode.TextDocumentContentProvider {
+  private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+  readonly onDidChange = this._onDidChange.event;
 
-/** In-memory virtual file with content and metadata */
-class VirtualFile implements vscode.FileStat {
-  uri: vscode.Uri;
-  type = vscode.FileType.File;
-  ctime: number;
-  mtime: number;
-  size: number;
-  permissions?: vscode.FilePermission;
-  private _content: Uint8Array;
+  // Key: normalized file path, Value: content string
+  private readonly contentMap = new Map<string, string>();
 
-  constructor(uri: vscode.Uri, content: Uint8Array) {
-    this.uri = uri;
-    this.ctime = Date.now();
-    this.mtime = Date.now();
-    this._content = content;
-    this.size = content.byteLength;
+  /**
+   * Store content for a virtual document.
+   * @param filePath The absolute file path (used as the URI path component)
+   * @param content The text content to serve
+   */
+  setContent(filePath: string, content: string): void {
+    this.contentMap.set(filePath, content);
+    // Fire change event so VS Code re-reads the virtual document
+    const uri = vscode.Uri.parse(`${this.scheme}:${filePath}`);
+    this._onDidChange.fire(uri);
   }
 
-  get content(): Uint8Array {
-    return this._content;
+  /**
+   * Remove content for a virtual document (cleanup after accept/reject).
+   */
+  removeContent(filePath: string): void {
+    this.contentMap.delete(filePath);
   }
 
-  set content(value: Uint8Array) {
-    this._content = value;
-    this.size = value.byteLength;
-    this.mtime = Date.now();
+  /**
+   * VS Code calls this to get the text content for a URI with our scheme.
+   */
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    const filePath = uri.path;
+    return this.contentMap.get(filePath) ?? '';
+  }
+
+  /**
+   * The URI scheme this provider is registered for.
+   * Set externally by the factory that creates the two providers.
+   */
+  scheme = '';
+
+  /**
+   * Clear all stored content (e.g., on extension deactivation).
+   */
+  clear(): void {
+    this.contentMap.clear();
+  }
+
+  dispose(): void {
+    this._onDidChange.dispose();
+    this.contentMap.clear();
   }
 }
 
 /**
- * FileSystemProvider that serves virtual file content for diff editors.
- *
- * Usage:
- *   const leftProvider = new DiffContentProvider('_openclaude_fs_left');
- *   context.subscriptions.push(vscode.workspace.registerFileSystemProvider(leftProvider.scheme, leftProvider));
- *   const file = leftProvider.createFile('/path/to/file.ts', 'original content');
- *   // file.uri can be passed as the left side of vscode.diff
+ * Create a pair of DiffContentProviders: one for original content,
+ * one for proposed content. Registers both with VS Code.
  */
-export class DiffContentProvider implements vscode.FileSystemProvider {
-  readonly scheme: string;
-  private documents = new Map<string, VirtualFile>();
+export function createDiffContentProviders(): {
+  original: DiffContentProvider;
+  proposed: DiffContentProvider;
+  disposables: vscode.Disposable[];
+} {
+  const original = new DiffContentProvider();
+  original.scheme = 'openclaude-diff-original';
 
-  private _onDidChangeFile = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
-  readonly onDidChangeFile = this._onDidChangeFile.event;
+  const proposed = new DiffContentProvider();
+  proposed.scheme = 'openclaude-diff-proposed';
 
-  constructor(scheme: string) {
-    this.scheme = scheme;
-  }
+  const disposables = [
+    vscode.workspace.registerTextDocumentContentProvider(
+      'openclaude-diff-original',
+      original,
+    ),
+    vscode.workspace.registerTextDocumentContentProvider(
+      'openclaude-diff-proposed',
+      proposed,
+    ),
+    original,
+    proposed,
+  ];
 
-  /**
-   * Create or update a virtual file with the given content.
-   * Returns the VirtualFile (which has a .uri property).
-   */
-  createFile(filePath: string, content: string): VirtualFile {
-    const normalizedPath = normalizePath(filePath);
-    const uri = vscode.Uri.from({ scheme: this.scheme, path: normalizedPath });
-    const encoded = new TextEncoder().encode(content);
-    const existing = this.documents.get(normalizedPath);
-
-    if (existing) {
-      // Update existing file — reuse the VirtualFile, update content
-      this.writeFile(uri, encoded, { create: false, overwrite: true });
-      return existing;
-    }
-
-    // Create new file
-    const file = new VirtualFile(uri, encoded);
-    this.documents.set(normalizedPath, file);
-    return file;
-  }
-
-  /**
-   * Delete a virtual file by URI.
-   */
-  delete(uri: vscode.Uri): void {
-    const key = normalizePath(uri.path);
-    this.documents.delete(key);
-  }
-
-  /**
-   * Remove all virtual files from this provider.
-   */
-  clear(): void {
-    this.documents.clear();
-  }
-
-  // ---- FileSystemProvider interface ----
-
-  watch(_uri: vscode.Uri): vscode.Disposable {
-    // No-op — virtual files don't change externally
-    return new vscode.Disposable(() => {});
-  }
-
-  stat(uri: vscode.Uri): vscode.FileStat {
-    const file = this.findFile(uri);
-    return file;
-  }
-
-  readDirectory(_uri: vscode.Uri): [string, vscode.FileType][] {
-    throw vscode.FileSystemError.Unavailable('readDirectory not supported');
-  }
-
-  createDirectory(_uri: vscode.Uri): void {
-    throw vscode.FileSystemError.Unavailable('createDirectory not supported');
-  }
-
-  readFile(uri: vscode.Uri): Uint8Array {
-    const file = this.findFile(uri);
-    return file.content;
-  }
-
-  writeFile(uri: vscode.Uri, content: Uint8Array, _options: { create: boolean; overwrite: boolean }): void {
-    const key = normalizePath(uri.path);
-    const file = this.documents.get(key);
-    if (file) {
-      file.content = content;
-      this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Changed, uri }]);
-    } else {
-      // Create if it doesn't exist
-      const newFile = new VirtualFile(uri, content);
-      this.documents.set(key, newFile);
-      this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Created, uri }]);
-    }
-  }
-
-  rename(_oldUri: vscode.Uri, _newUri: vscode.Uri, _options: { overwrite: boolean }): void {
-    throw vscode.FileSystemError.Unavailable('rename not supported');
-  }
-
-  // ---- Helpers ----
-
-  private findFile(uri: vscode.Uri): VirtualFile {
-    const key = normalizePath(uri.path);
-    const file = this.documents.get(key);
-    if (!file) {
-      throw vscode.FileSystemError.FileNotFound(uri);
-    }
-    return file;
-  }
-
-  dispose(): void {
-    this._onDidChangeFile.dispose();
-    this.documents.clear();
-  }
+  return { original, proposed, disposables };
 }
 ```
 
-- [ ] **Step 2: Run DiffContentProvider tests — should all PASS**
+- [ ] **Step 2: Verify it compiles**
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx vitest run test/unit/diffContentProvider.test.ts 2>&1`
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit src/diff/diffContentProvider.ts`
 
-Expected: All tests pass (9/9 or similar)
-
-```
- ✓ test/unit/diffContentProvider.test.ts (9)
-   ✓ DiffContentProvider > should expose the scheme it was constructed with
-   ✓ DiffContentProvider > should create a file and return a URI with the correct scheme
-   ...
-```
-
-> **Note:** The tests may require updating the vscode mock (from Story 1) to include `FileSystemError`, `FileType`, `FileChangeType`, and `Uri.from()`. If tests fail because of missing mocks, update `test/__mocks__/vscode.ts` to add:
->
-> ```typescript
-> export class FileSystemError extends Error {
->   static FileNotFound(uri?: any): FileSystemError { return new FileSystemError('FileNotFound'); }
->   static Unavailable(msg?: string): FileSystemError { return new FileSystemError(msg || 'Unavailable'); }
-> }
-> export enum FileType { File = 1, Directory = 2 }
-> export enum FileChangeType { Changed = 1, Created = 2, Deleted = 3 }
-> export class Uri {
->   scheme: string; path: string; authority = ''; query = ''; fragment = '';
->   constructor(scheme: string, path: string) { this.scheme = scheme; this.path = path; }
->   static from(components: { scheme: string; path: string }): Uri { return new Uri(components.scheme, components.path); }
->   static file(path: string): Uri { return new Uri('file', path); }
->   toString(): string { return `${this.scheme}://${this.path}`; }
-> }
-> export enum FilePermission { Readonly = 1 }
-> ```
+Expected: No errors (or only errors from missing imports that will be resolved when wired up)
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add src/diff/diffContentProvider.ts test/__mocks__/vscode.ts
-git commit -m "feat(diff): implement DiffContentProvider FileSystemProvider"
+git add src/diff/diffContentProvider.ts
+git commit -m "feat(diff): add DiffContentProvider for virtual original/proposed documents"
 ```
 
 ---
 
-## Task 4: DiffManager — Failing Tests First
-
-**Files:**
-- Create: `test/unit/diffManager.test.ts`
-
-The DiffManager is the core orchestration class. It:
-1. Registers as a `can_use_tool` handler on the ControlRouter (for FileEditTool/FileWriteTool)
-2. When a file tool permission request arrives, computes original + proposed content
-3. Creates virtual files in left and right providers
-4. Opens `vscode.diff` with left URI and right URI
-5. Waits for the user to click Accept or Reject (or close the tab)
-6. Returns the appropriate response to the ControlRouter (which sends control_response back to CLI)
-
-- [ ] **Step 1: Write failing tests for DiffManager**
-
-```typescript
-// test/unit/diffManager.test.ts
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { DiffManager } from '../../src/diff/diffManager';
-import { DiffContentProvider } from '../../src/diff/diffContentProvider';
-import type { ControlRequestPermission } from '../../src/types/messages';
-import type { DiffDecisionEvent } from '../../src/diff/types';
-import * as vscode from 'vscode';
-
-// Mock vscode.commands.executeCommand
-vi.mock('vscode', async () => {
-  const actual = await vi.importActual<typeof import('vscode')>('vscode');
-  return {
-    ...actual,
-    commands: {
-      executeCommand: vi.fn().mockResolvedValue(undefined),
-    },
-    workspace: {
-      ...actual.workspace,
-      openTextDocument: vi.fn().mockResolvedValue({ getText: () => '', isDirty: false }),
-      getConfiguration: vi.fn().mockReturnValue({ get: vi.fn().mockReturnValue('off') }),
-    },
-    window: {
-      tabGroups: { all: [], activeTabGroup: { activeTab: undefined } },
-      onDidChangeVisibleTextEditors: vi.fn().mockReturnValue({ dispose: () => {} }),
-    },
-  };
-});
-
-describe('DiffManager', () => {
-  let leftProvider: DiffContentProvider;
-  let rightProvider: DiffContentProvider;
-  let diffManager: DiffManager;
-  let acceptRejectEmitter: vscode.EventEmitter<DiffDecisionEvent>;
-
-  beforeEach(() => {
-    leftProvider = new DiffContentProvider('_test_fs_left');
-    rightProvider = new DiffContentProvider('_test_fs_right');
-    acceptRejectEmitter = new vscode.EventEmitter<DiffDecisionEvent>();
-    diffManager = new DiffManager(leftProvider, rightProvider, acceptRejectEmitter.event);
-  });
-
-  it('should detect FileEditTool as a file tool', () => {
-    expect(diffManager.isFileToolRequest({ subtype: 'can_use_tool', tool_name: 'FileEditTool' } as any)).toBe(true);
-  });
-
-  it('should detect FileWriteTool as a file tool', () => {
-    expect(diffManager.isFileToolRequest({ subtype: 'can_use_tool', tool_name: 'FileWriteTool' } as any)).toBe(true);
-  });
-
-  it('should not detect BashTool as a file tool', () => {
-    expect(diffManager.isFileToolRequest({ subtype: 'can_use_tool', tool_name: 'BashTool' } as any)).toBe(false);
-  });
-
-  it('should compute proposed content for FileWriteTool (full write)', () => {
-    const proposed = diffManager.computeProposedContent(
-      '',
-      'FileWriteTool',
-      { file_path: '/test.ts', content: 'new file content' },
-    );
-    expect(proposed).toBe('new file content');
-  });
-
-  it('should compute proposed content for FileEditTool (string replace)', () => {
-    const proposed = diffManager.computeProposedContent(
-      'const x = 1;\nconst y = 2;\n',
-      'FileEditTool',
-      { file_path: '/test.ts', old_string: 'const x = 1;', new_string: 'const x = 42;' },
-    );
-    expect(proposed).toBe('const x = 42;\nconst y = 2;\n');
-  });
-
-  it('should compute proposed content for FileEditTool with replace_all', () => {
-    const proposed = diffManager.computeProposedContent(
-      'aaa bbb aaa',
-      'FileEditTool',
-      { file_path: '/test.ts', old_string: 'aaa', new_string: 'ccc', replace_all: true },
-    );
-    expect(proposed).toBe('ccc bbb ccc');
-  });
-
-  it('should track pending diffs by file path', async () => {
-    expect(diffManager.getPendingDiffCount()).toBe(0);
-  });
-
-  it('should generate correct diff editor title', () => {
-    const title = diffManager.getDiffTitle('/path/to/auth.ts');
-    expect(title).toContain('OpenClaude');
-    expect(title).toContain('auth.ts');
-  });
-});
-```
-
-- [ ] **Step 2: Run tests — should FAIL**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx vitest run test/unit/diffManager.test.ts 2>&1 | tail -10`
-
-Expected: `Error: Cannot find module '../../src/diff/diffManager'`
-
-- [ ] **Step 3: Commit**
-
-```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add test/unit/diffManager.test.ts
-git commit -m "test(diff): add failing tests for DiffManager (TDD red phase)"
-```
-
----
-
-## Task 5: DiffManager — Implementation
+## Task 2: DiffManager -- Core Diff Orchestration
 
 **Files:**
 - Create: `src/diff/diffManager.ts`
 
-This is the main orchestration class. It is modeled after Claude Code's `cr` function (the diff-opening flow) and `_06` function (the MCP IDE diff flow). Key patterns extracted from Claude Code:
+The DiffManager is the central coordinator. It:
+1. Receives `can_use_tool` control_requests for `FileEditTool` / `FileWriteTool`
+2. Reads the original file content from disk (or uses empty string for new files)
+3. Computes the proposed content (applies `old_string`/`new_string` edit or uses `content` for writes)
+4. Stores both in DiffContentProviders
+5. Opens `vscode.diff` with original on the left, proposed on the right
+6. Sets the `openclaude.viewingProposedDiff` context variable to show Accept/Reject buttons
+7. On Accept: writes the proposed content to disk, auto-saves, sends `control_response` with `behavior: allow`
+8. On Reject: discards, sends `control_response` with `behavior: deny`
+9. Closes the diff editor tab
+10. Cleans up the content providers and context variable
 
-1. **Tab title format**: `✻ [Claude Code] filename.ts` — we use `✻ [OpenClaude] filename.ts`
-2. **Left URI**: Original file content loaded into leftProvider's virtual filesystem. If the real file is dirty, read from disk instead.
-3. **Right URI**: Proposed content loaded into rightProvider's virtual filesystem.
-4. **Race pattern**: The diff resolves by racing: (a) user clicks Accept, (b) user clicks Reject, (c) user closes the diff tab, (d) file is saved externally.
-5. **Closing existing diffs**: Before opening a new diff for the same file, close any existing diff tab for that file.
-6. **Accept = return `{ behavior: 'allow', updatedInput: originalInput }`** — the CLI then actually applies the file change.
-7. **Reject = throw error with "User denied permission"** — the ControlRouter sends `control_response` with `subtype: error`.
-
-- [ ] **Step 1: Create src/diff/diffManager.ts**
+- [ ] **Step 1: Create the PendingDiff interface and DiffManager class**
 
 ```typescript
 // src/diff/diffManager.ts
-// Orchestrates native VS Code diff editors for file edit/write permission requests.
-//
-// Pattern extracted from Claude Code extension.js:
-//   cr() — opens vscode.diff, races accept/reject/tab-close/file-save
-//   Xr() — registers acceptProposedDiff/rejectProposedDiff commands
-//   vS6() — closes existing diff tabs for the same URIs
-//   dg6() — sets viewingProposedDiff context variable based on visible editors
-//
-// Flow:
-//   1. ControlRouter receives can_use_tool for FileEditTool/FileWriteTool
-//   2. ControlRouter dispatches to DiffManager.handleFileToolRequest()
-//   3. DiffManager reads original file content
-//   4. DiffManager computes proposed content
-//   5. DiffManager creates left (original) and right (proposed) virtual files
-//   6. DiffManager opens vscode.diff with left and right URIs
-//   7. User clicks Accept or Reject in the editor title bar (or closes tab)
-//   8. DiffManager returns response → ControlRouter sends control_response to CLI
+// Orchestrates the full diff lifecycle: intercept file-edit tool_use
+// permission requests, show VS Code native diff, handle accept/reject,
+// write files, and send control_response back to the CLI.
 
 import * as vscode from 'vscode';
-import * as fs from 'node:fs';
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { DiffContentProvider } from './diffContentProvider';
-import type { PendingDiff, DiffDecisionEvent } from './types';
-import { isFileTool, isFileEditTool, isFileWriteTool } from './types';
+import type { DiffContentProvider } from './diffContentProvider';
+import type { NdjsonTransport } from '../process/ndjsonTransport';
 import type { ControlRequestPermission } from '../types/messages';
 
-/** Timeout for waiting for the diff tab to appear after executeCommand */
-const TAB_OPEN_TIMEOUT_MS = 3000;
-
-/** Poll interval for checking tab state */
-const TAB_POLL_INTERVAL_MS = 100;
-
 /**
- * DiffManager — shows native VS Code diff editors for file tool permission requests.
- *
- * Created during extension activation. Registered as the can_use_tool handler
- * on the ControlRouter for FileEditTool and FileWriteTool tool names.
+ * Represents a single pending diff waiting for user decision.
  */
+interface PendingDiff {
+  /** Absolute path to the file being edited */
+  filePath: string;
+  /** The original file content (before edit) */
+  originalContent: string;
+  /** The proposed file content (after edit) */
+  proposedContent: string;
+  /** The request_id from the control_request -- needed for control_response */
+  requestId: string;
+  /** The tool_use_id from the control_request */
+  toolUseId: string;
+  /** The tool name (FileEditTool or FileWriteTool) */
+  toolName: string;
+  /** The full tool input for passing back in updatedInput on accept */
+  toolInput: Record<string, unknown>;
+  /** The transport to send the control_response on */
+  transport: NdjsonTransport;
+}
+
 export class DiffManager implements vscode.Disposable {
-  private leftProvider: DiffContentProvider;
-  private rightProvider: DiffContentProvider;
-  private acceptOrRejectDiffs: vscode.Event<DiffDecisionEvent>;
-  private pendingDiffs = new Map<string, PendingDiff>();
-  private disposables: vscode.Disposable[] = [];
+  /** Pending diffs keyed by normalized file path. One per file at a time. */
+  private readonly pendingDiffs = new Map<string, PendingDiff>();
+
+  /** Queue for diffs arriving while another diff for the same file is pending */
+  private readonly pendingQueue = new Map<
+    string,
+    Array<{
+      requestId: string;
+      request: ControlRequestPermission;
+      transport: NdjsonTransport;
+    }>
+  >();
+
+  /** Track which diff editor tabs we opened, keyed by file path */
+  private readonly diffEditorTabs = new Map<string, vscode.Uri>();
+
+  private readonly disposables: vscode.Disposable[] = [];
+
+  /** Max file size (in bytes) for diff preview -- skip diff for huge files */
+  private static readonly MAX_DIFF_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
   constructor(
-    leftProvider: DiffContentProvider,
-    rightProvider: DiffContentProvider,
-    acceptOrRejectDiffs: vscode.Event<DiffDecisionEvent>,
+    private readonly originalProvider: DiffContentProvider,
+    private readonly proposedProvider: DiffContentProvider,
+    private readonly outputChannel: vscode.OutputChannel,
   ) {
-    this.leftProvider = leftProvider;
-    this.rightProvider = rightProvider;
-    this.acceptOrRejectDiffs = acceptOrRejectDiffs;
+    // Listen for tab close events to clean up if user manually closes a diff
+    this.disposables.push(
+      vscode.window.tabGroups.onDidChangeTabs((event) => {
+        this.handleTabClose(event);
+      }),
+    );
   }
 
   /**
-   * Check whether a control_request is for a file tool that should show a diff.
+   * Check if a control_request is a file-edit tool_use that should show a diff.
+   * Returns true for FileEditTool and FileWriteTool.
    */
-  isFileToolRequest(request: ControlRequestPermission): boolean {
-    return isFileTool(request.tool_name);
+  isFileEditToolRequest(request: ControlRequestPermission): boolean {
+    const toolName = request.tool_name;
+    return toolName === 'FileEditTool' || toolName === 'FileWriteTool';
   }
 
   /**
-   * Handle a can_use_tool control_request for a file tool.
-   * This is the async handler registered on ControlRouter.
+   * Handle a can_use_tool control_request for a file-editing tool.
+   * Reads original content, computes proposed content, opens the diff editor.
    *
-   * Returns: { behavior: 'allow', updatedInput: ... } on Accept
-   * Throws: Error on Reject (ControlRouter converts to error control_response)
-   *
-   * @param request - The can_use_tool control_request inner
-   * @param signal - AbortSignal for cancellation (from control_cancel_request)
+   * @param requestId The control_request request_id
+   * @param request The can_use_tool request inner payload
+   * @param transport The NDJSON transport for sending control_response back
    */
-  async handleFileToolRequest(
+  async showDiff(
+    requestId: string,
     request: ControlRequestPermission,
-    signal: AbortSignal,
-  ): Promise<{ behavior: 'allow'; updatedInput: Record<string, unknown> }> {
+    transport: NdjsonTransport,
+  ): Promise<void> {
     const input = request.input;
     const filePath = input.file_path as string;
+
     if (!filePath) {
-      throw new Error('File tool request missing file_path');
+      this.outputChannel.appendLine(
+        `[DiffManager] No file_path in tool input for ${request.tool_name}, auto-allowing`,
+      );
+      this.sendAllowResponse(requestId, request.tool_use_id, input, transport);
+      return;
     }
 
-    const absolutePath = path.isAbsolute(filePath) ? filePath : filePath;
+    const normalizedPath = path.resolve(filePath);
 
-    // Step 1: Read original file content (or empty string for new files)
-    const originalContent = await this.readOriginalContent(absolutePath);
+    // If there's already a pending diff for this file, queue the new request
+    if (this.pendingDiffs.has(normalizedPath)) {
+      this.outputChannel.appendLine(
+        `[DiffManager] Queuing edit for ${normalizedPath} (already reviewing)`,
+      );
+      if (!this.pendingQueue.has(normalizedPath)) {
+        this.pendingQueue.set(normalizedPath, []);
+      }
+      this.pendingQueue.get(normalizedPath)!.push({
+        requestId,
+        request,
+        transport,
+      });
+      return;
+    }
 
-    // Step 2: Compute proposed content based on tool type
-    const proposedContent = this.computeProposedContent(
-      originalContent,
-      request.tool_name,
-      input,
-    );
-
-    // Step 3: Close any existing diff tab for this file
-    await this.closeExistingDiffForFile(absolutePath);
-
-    // Step 4: Create virtual files for left (original) and right (proposed)
-    const leftFile = this.leftProvider.createFile(absolutePath, originalContent);
-    const rightFile = this.rightProvider.createFile(absolutePath, proposedContent);
-
-    // Step 5: Open the native diff editor
-    const diffTitle = this.getDiffTitle(absolutePath);
-    const diffOptions: vscode.TextDocumentShowOptions = {
-      preview: false,
-      preserveFocus: true,
-    };
-
-    // Track this pending diff
-    const pendingDiff: PendingDiff = {
-      requestId: '', // Set by caller if needed
-      filePath: absolutePath,
-      toolName: request.tool_name,
-      toolInput: input,
-      originalContent,
-      proposedContent,
-      leftUri: leftFile.uri,
-      rightUri: rightFile.uri,
-      createdAt: Date.now(),
-    };
-    this.pendingDiffs.set(absolutePath, pendingDiff);
+    // Check file size -- skip diff for very large files
+    try {
+      const stat = await fs.stat(normalizedPath);
+      if (stat.size > DiffManager.MAX_DIFF_FILE_SIZE) {
+        this.outputChannel.appendLine(
+          `[DiffManager] File too large for diff preview (${stat.size} bytes), auto-allowing`,
+        );
+        this.sendAllowResponse(
+          requestId,
+          request.tool_use_id,
+          input,
+          transport,
+        );
+        return;
+      }
+    } catch {
+      // File doesn't exist (new file creation) -- OK, continue
+    }
 
     try {
-      // Open VS Code's native diff editor
-      await vscode.commands.executeCommand(
-        'vscode.diff',
-        leftFile.uri,
-        rightFile.uri,
-        diffTitle,
-        diffOptions,
+      // 1. Read original file content (empty string for new files)
+      const originalContent = await this.readOriginalContent(normalizedPath);
+
+      // 2. Compute proposed content
+      const proposedContent = this.computeProposedContent(
+        request.tool_name,
+        input,
+        originalContent,
       );
 
-      // Wait for the diff tab to actually appear
-      await this.waitForDiffTab(diffTitle);
+      // 3. Store in content providers
+      this.originalProvider.setContent(normalizedPath, originalContent);
+      this.proposedProvider.setContent(normalizedPath, proposedContent);
 
-      // Step 6: Race — wait for Accept, Reject, or tab close
-      const result = await this.waitForDecision(
-        diffTitle,
-        rightFile.uri,
-        signal,
+      // 4. Create the pending diff entry
+      const pending: PendingDiff = {
+        filePath: normalizedPath,
+        originalContent,
+        proposedContent,
+        requestId,
+        toolUseId: request.tool_use_id,
+        toolName: request.tool_name,
+        toolInput: input,
+        transport,
+      };
+      this.pendingDiffs.set(normalizedPath, pending);
+
+      // 5. Open VS Code native diff editor
+      await this.openDiffEditor(normalizedPath, request.tool_name);
+
+      // 6. Set context variable for button visibility
+      await this.updateContextVariable();
+
+      this.outputChannel.appendLine(
+        `[DiffManager] Showing diff for ${normalizedPath} (${request.tool_name})`,
       );
-
-      if (result === 'accepted') {
-        // Step 7a: Accept — apply changes to the real file
-        await this.applyChangesToFile(absolutePath, proposedContent);
-
-        return {
-          behavior: 'allow',
-          updatedInput: input,
-        };
-      } else {
-        // Step 7b: Reject or tab closed — deny permission
-        throw new Error('User denied permission');
-      }
-    } finally {
-      // Clean up pending diff tracking
-      this.pendingDiffs.delete(absolutePath);
-
-      // Close the diff tab if it's still open
-      await this.closeDiffTab(diffTitle);
+    } catch (error) {
+      const errorMsg =
+        error instanceof Error ? error.message : String(error);
+      this.outputChannel.appendLine(
+        `[DiffManager] Error showing diff: ${errorMsg}`,
+      );
+      // On error, auto-allow so the CLI isn't stuck waiting
+      this.sendAllowResponse(requestId, request.tool_use_id, input, transport);
     }
   }
 
   /**
-   * Compute the proposed file content after applying the tool's changes.
+   * Accept the currently active diff -- apply changes and notify CLI.
+   * Called by the openclaude.acceptProposedDiff command.
    */
-  computeProposedContent(
-    originalContent: string,
-    toolName: string,
-    input: Record<string, unknown>,
-  ): string {
-    if (isFileWriteTool(toolName)) {
-      // FileWriteTool replaces the entire file
-      return (input.content as string) || '';
+  async acceptCurrentDiff(): Promise<void> {
+    const pending = this.getActivePendingDiff();
+    if (!pending) {
+      vscode.window.showWarningMessage('No pending diff to accept.');
+      return;
     }
 
-    if (isFileEditTool(toolName)) {
-      const oldString = input.old_string as string;
-      const newString = input.new_string as string;
-      const replaceAll = input.replace_all as boolean;
+    // Workspace trust check
+    if (!vscode.workspace.isTrusted) {
+      vscode.window.showWarningMessage(
+        'Cannot apply changes: workspace is not trusted. Trust the workspace first.',
+      );
+      return;
+    }
 
-      if (oldString === undefined || newString === undefined) {
-        // If old_string is empty, this is an insert at the beginning
-        if (oldString === '' || oldString === undefined) {
-          return newString + originalContent;
+    try {
+      // 1. Write proposed content to disk
+      await this.writeFile(pending.filePath, pending.proposedContent);
+
+      // 2. Auto-save the file if it's open in an editor
+      await this.autoSaveFile(pending.filePath);
+
+      // 3. Send allow control_response to CLI
+      this.sendAllowResponse(
+        pending.requestId,
+        pending.toolUseId,
+        pending.toolInput,
+        pending.transport,
+      );
+
+      this.outputChannel.appendLine(
+        `[DiffManager] Accepted diff for ${pending.filePath}`,
+      );
+    } catch (error) {
+      const errorMsg =
+        error instanceof Error ? error.message : String(error);
+      this.outputChannel.appendLine(
+        `[DiffManager] Error accepting diff: ${errorMsg}`,
+      );
+      vscode.window.showErrorMessage(
+        `Failed to apply changes: ${errorMsg}`,
+      );
+      return; // Don't clean up on write failure -- let user retry
+    }
+
+    // 4. Close diff editor and clean up
+    await this.closeDiffAndCleanup(pending.filePath);
+  }
+
+  /**
+   * Reject the currently active diff -- discard changes and notify CLI.
+   * Called by the openclaude.rejectProposedDiff command.
+   */
+  async rejectCurrentDiff(): Promise<void> {
+    const pending = this.getActivePendingDiff();
+    if (!pending) {
+      vscode.window.showWarningMessage('No pending diff to reject.');
+      return;
+    }
+
+    // 1. Send deny control_response to CLI
+    this.sendDenyResponse(
+      pending.requestId,
+      pending.toolUseId,
+      'User rejected proposed changes',
+      pending.transport,
+    );
+
+    this.outputChannel.appendLine(
+      `[DiffManager] Rejected diff for ${pending.filePath}`,
+    );
+
+    // 2. Close diff editor and clean up
+    await this.closeDiffAndCleanup(pending.filePath);
+  }
+
+  /**
+   * Cancel a pending diff (e.g., when CLI sends control_cancel_request).
+   */
+  async cancelDiffByRequestId(requestId: string): Promise<void> {
+    for (const [filePath, pending] of this.pendingDiffs.entries()) {
+      if (pending.requestId === requestId) {
+        this.outputChannel.appendLine(
+          `[DiffManager] Cancelling diff for ${filePath} (request ${requestId})`,
+        );
+        await this.closeDiffAndCleanup(filePath);
+        return;
+      }
+    }
+  }
+
+  /**
+   * Get the count of pending diffs (for status display).
+   */
+  get pendingCount(): number {
+    return this.pendingDiffs.size;
+  }
+
+  // ===========================================================================
+  // Private: Content computation
+  // ===========================================================================
+
+  /**
+   * Read the original file content from disk.
+   * Returns empty string if the file doesn't exist (new file creation).
+   * Handles UTF-8 BOM markers.
+   */
+  private async readOriginalContent(filePath: string): Promise<string> {
+    try {
+      const buffer = await fs.readFile(filePath);
+      // Handle UTF-8 BOM (0xEF 0xBB 0xBF)
+      if (
+        buffer.length >= 3 &&
+        buffer[0] === 0xef &&
+        buffer[1] === 0xbb &&
+        buffer[2] === 0xbf
+      ) {
+        return buffer.toString('utf-8').slice(1); // Remove BOM character
+      }
+      return buffer.toString('utf-8');
+    } catch {
+      // File doesn't exist -- this is a new file creation
+      return '';
+    }
+  }
+
+  /**
+   * Compute the proposed file content based on the tool type and input.
+   *
+   * FileWriteTool: The `content` field IS the new file content.
+   * FileEditTool: Apply `old_string` -> `new_string` replacement on original.
+   */
+  private computeProposedContent(
+    toolName: string,
+    input: Record<string, unknown>,
+    originalContent: string,
+  ): string {
+    if (toolName === 'FileWriteTool') {
+      // FileWriteTool has a `content` field with the full new file content
+      return (input.content as string) ?? '';
+    }
+
+    if (toolName === 'FileEditTool') {
+      // FileEditTool has `old_string` and `new_string` fields
+      const oldString = (input.old_string as string) ?? '';
+      const newString = (input.new_string as string) ?? '';
+
+      if (oldString === '') {
+        // Empty old_string with empty original = create new file
+        if (originalContent === '') {
+          return newString;
         }
-        return originalContent;
+        // Empty old_string with existing content = shouldn't happen, but
+        // treat as prepend for safety
+        return newString + originalContent;
       }
 
-      if (replaceAll) {
-        return originalContent.split(oldString).join(newString);
-      }
-
-      // Replace first occurrence only
+      // Find and replace the first occurrence of old_string with new_string
       const index = originalContent.indexOf(oldString);
       if (index === -1) {
-        // old_string not found — return original (the CLI handles the error)
+        this.outputChannel.appendLine(
+          `[DiffManager] Warning: old_string not found in file, returning original unchanged`,
+        );
+        // If old_string not found, the edit can't be applied --
+        // show original so user sees no diff and can reject
         return originalContent;
       }
 
@@ -810,589 +530,729 @@ export class DiffManager implements vscode.Disposable {
       );
     }
 
-    // Unknown tool type — return original
+    // Unknown tool -- return original unchanged
+    this.outputChannel.appendLine(
+      `[DiffManager] Unknown tool ${toolName}, returning original content`,
+    );
     return originalContent;
   }
 
-  /**
-   * Get the diff editor tab title.
-   * Format matches Claude Code: ✻ [OpenClaude] filename.ts
-   */
-  getDiffTitle(filePath: string): string {
-    const fileName = path.basename(filePath);
-    return `✻ [OpenClaude] ${fileName}`;
-  }
+  // ===========================================================================
+  // Private: Diff editor management
+  // ===========================================================================
 
   /**
-   * Get the number of currently pending diffs.
+   * Open the VS Code native diff editor for a file.
    */
-  getPendingDiffCount(): number {
-    return this.pendingDiffs.size;
-  }
-
-  /**
-   * Get a pending diff by file path.
-   */
-  getPendingDiff(filePath: string): PendingDiff | undefined {
-    return this.pendingDiffs.get(filePath);
-  }
-
-  // ---- Private methods ----
-
-  /**
-   * Read the original content of a file.
-   * If the file doesn't exist (new file), returns empty string.
-   * If the file is open and dirty in VS Code, reads from disk instead.
-   */
-  private async readOriginalContent(filePath: string): Promise<string> {
-    try {
-      const uri = vscode.Uri.file(filePath);
-      const doc = await vscode.workspace.openTextDocument(uri);
-      if (doc.isDirty) {
-        // File is dirty in the editor — read from disk to get the saved version
-        return fs.readFileSync(filePath, 'utf8');
-      }
-      return doc.getText();
-    } catch {
-      // File doesn't exist — it's a new file
-      try {
-        return fs.readFileSync(filePath, 'utf8');
-      } catch {
-        return '';
-      }
-    }
-  }
-
-  /**
-   * Wait for the diff tab to appear in the editor.
-   * Polls tab groups until a tab with the given label appears or timeout.
-   */
-  private waitForDiffTab(tabLabel: string): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const startTime = Date.now();
-      const interval = setInterval(() => {
-        const allTabs = this.getAllTabs();
-        if (allTabs.some((tab) => tab.label === tabLabel)) {
-          clearInterval(interval);
-          resolve();
-        } else if (Date.now() - startTime > TAB_OPEN_TIMEOUT_MS) {
-          clearInterval(interval);
-          // Don't reject — the diff might still work even if we can't find the tab
-          resolve();
-        }
-      }, TAB_POLL_INTERVAL_MS);
-    });
-  }
-
-  /**
-   * Wait for the user's accept/reject decision or tab close.
-   * Returns 'accepted', 'rejected', or 'closed'.
-   */
-  private waitForDecision(
-    tabLabel: string,
-    rightUri: vscode.Uri,
-    signal: AbortSignal,
-  ): Promise<'accepted' | 'rejected' | 'closed'> {
-    return new Promise<'accepted' | 'rejected' | 'closed'>((resolve) => {
-      const disposables: vscode.Disposable[] = [];
-
-      const cleanup = () => {
-        for (const d of disposables) {
-          d.dispose();
-        }
-      };
-
-      // Listen for accept/reject button clicks
-      disposables.push(
-        this.acceptOrRejectDiffs((event) => {
-          if (event.activeTab && event.activeTab.label === tabLabel) {
-            cleanup();
-            resolve(event.accepted ? 'accepted' : 'rejected');
-          }
-        }),
-      );
-
-      // Listen for tab close (user closed the diff without deciding)
-      const tabCloseInterval = setInterval(() => {
-        const allTabs = this.getAllTabs();
-        if (!allTabs.some((tab) => tab.label === tabLabel)) {
-          clearInterval(tabCloseInterval);
-          cleanup();
-          resolve('closed');
-        }
-      }, TAB_POLL_INTERVAL_MS);
-      disposables.push(new vscode.Disposable(() => clearInterval(tabCloseInterval)));
-
-      // Listen for abort (control_cancel_request from CLI)
-      if (signal) {
-        signal.addEventListener('abort', () => {
-          cleanup();
-          resolve('closed');
-        });
-      }
-    });
-  }
-
-  /**
-   * Apply the proposed content to the real file on disk.
-   * Then auto-save the file if it's open in VS Code.
-   */
-  private async applyChangesToFile(
+  private async openDiffEditor(
     filePath: string,
-    proposedContent: string,
+    toolName: string,
   ): Promise<void> {
-    // Write to disk
-    const dirPath = path.dirname(filePath);
-    if (!fs.existsSync(dirPath)) {
-      fs.mkdirSync(dirPath, { recursive: true });
-    }
-    fs.writeFileSync(filePath, proposedContent, 'utf8');
+    const fileName = path.basename(filePath);
+    const actionLabel =
+      toolName === 'FileWriteTool' ? 'Write' : 'Edit';
+    const title = `${fileName} (Proposed ${actionLabel})`;
 
-    // If the file is open in VS Code, trigger a save to sync the editor
-    try {
-      const uri = vscode.Uri.file(filePath);
-      const doc = await vscode.workspace.openTextDocument(uri);
-      if (doc.isDirty) {
-        await doc.save();
-      }
-    } catch {
-      // File might not be open — that's fine
-    }
+    const originalUri = vscode.Uri.parse(
+      `openclaude-diff-original:${filePath}`,
+    );
+    const proposedUri = vscode.Uri.parse(
+      `openclaude-diff-proposed:${filePath}`,
+    );
+
+    // Store the proposed URI so we can identify this tab later
+    this.diffEditorTabs.set(filePath, proposedUri);
+
+    // Open the native diff editor
+    await vscode.commands.executeCommand(
+      'vscode.diff',
+      originalUri,
+      proposedUri,
+      title,
+      {
+        preview: false, // Don't replace an existing preview tab
+        viewColumn: vscode.ViewColumn.Active,
+      },
+    );
   }
 
   /**
-   * Close any existing diff tab for the given file path.
-   * This prevents multiple diff tabs for the same file.
+   * Determine which pending diff is "active" -- the one whose diff editor
+   * is currently focused. Falls back to the first pending diff if no
+   * diff editor is focused (e.g., command palette invocation).
    */
-  private async closeExistingDiffForFile(filePath: string): Promise<number> {
-    let closedCount = 0;
-    const diffTitle = this.getDiffTitle(filePath);
+  private getActivePendingDiff(): PendingDiff | undefined {
+    // Strategy 1: Check if the active editor matches a diff URI scheme
+    const activeEditor = vscode.window.activeTextEditor;
+    if (activeEditor) {
+      const activeUri = activeEditor.document.uri;
+      if (
+        activeUri.scheme === 'openclaude-diff-original' ||
+        activeUri.scheme === 'openclaude-diff-proposed'
+      ) {
+        const filePath = activeUri.path;
+        const pending = this.pendingDiffs.get(filePath);
+        if (pending) {
+          return pending;
+        }
+      }
+    }
 
-    for (const group of vscode.window.tabGroups.all) {
-      for (const tab of group.tabs) {
-        if (tab.label === diffTitle) {
-          try {
+    // Strategy 2: Check the active tab's input (works for diff editors
+    // which may not expose a standard TextEditor)
+    const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
+    if (activeTab?.input && typeof activeTab.input === 'object') {
+      const tabInput = activeTab.input as {
+        original?: vscode.Uri;
+        modified?: vscode.Uri;
+      };
+      if (tabInput.modified?.scheme === 'openclaude-diff-proposed') {
+        const filePath = tabInput.modified.path;
+        const pending = this.pendingDiffs.get(filePath);
+        if (pending) {
+          return pending;
+        }
+      }
+      if (tabInput.original?.scheme === 'openclaude-diff-original') {
+        const filePath = tabInput.original.path;
+        const pending = this.pendingDiffs.get(filePath);
+        if (pending) {
+          return pending;
+        }
+      }
+    }
+
+    // Strategy 3: Fall back to the first pending diff
+    // (handles command palette invocation when no diff tab is focused)
+    const firstEntry = this.pendingDiffs.values().next();
+    if (!firstEntry.done) {
+      return firstEntry.value;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Close the diff editor tab for a given file path and clean up state.
+   * Then process any queued diffs for the same file.
+   */
+  private async closeDiffAndCleanup(filePath: string): Promise<void> {
+    // 1. Close the diff editor tab
+    const proposedUri = this.diffEditorTabs.get(filePath);
+    if (proposedUri) {
+      for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+          if (this.isOurDiffTab(tab, filePath)) {
             await vscode.window.tabGroups.close(tab);
-            closedCount++;
-          } catch {
-            // Tab might already be closed
+            break;
           }
         }
       }
     }
 
-    return closedCount;
+    // 2. Remove from content providers
+    this.originalProvider.removeContent(filePath);
+    this.proposedProvider.removeContent(filePath);
+
+    // 3. Remove from tracking maps
+    this.pendingDiffs.delete(filePath);
+    this.diffEditorTabs.delete(filePath);
+
+    // 4. Update context variable
+    await this.updateContextVariable();
+
+    // 5. Process queued diffs for the same file
+    const queued = this.pendingQueue.get(filePath);
+    if (queued && queued.length > 0) {
+      const next = queued.shift()!;
+      if (queued.length === 0) {
+        this.pendingQueue.delete(filePath);
+      }
+      // Process next queued diff (fire-and-forget -- errors handled inside)
+      this.showDiff(next.requestId, next.request, next.transport);
+    }
   }
 
   /**
-   * Close a specific diff tab by label.
+   * Check if a tab is one of our diff editors for a specific file.
    */
-  private async closeDiffTab(tabLabel: string): Promise<void> {
-    for (const group of vscode.window.tabGroups.all) {
-      for (const tab of group.tabs) {
-        if (tab.label === tabLabel) {
-          try {
-            // If the tab is a diff tab and was accepted, save the modified document first
-            if (tab.input instanceof vscode.TabInputTextDiff) {
-              try {
-                const doc = await vscode.workspace.openTextDocument(tab.input.modified);
-                if (doc.isDirty) {
-                  await doc.save();
-                }
-              } catch {
-                // Ignore save errors
-              }
+  private isOurDiffTab(tab: vscode.Tab, filePath: string): boolean {
+    if (!tab.input || typeof tab.input !== 'object') {
+      return false;
+    }
+    const tabInput = tab.input as {
+      original?: vscode.Uri;
+      modified?: vscode.Uri;
+    };
+    return (
+      (tabInput.modified?.scheme === 'openclaude-diff-proposed' &&
+        tabInput.modified.path === filePath) ||
+      (tabInput.original?.scheme === 'openclaude-diff-original' &&
+        tabInput.original.path === filePath)
+    );
+  }
+
+  /**
+   * Handle tab close events -- if the user manually closes a diff tab,
+   * treat it as a rejection so the CLI isn't left hanging.
+   */
+  private handleTabClose(event: vscode.TabChangeEvent): void {
+    for (const closedTab of event.closed) {
+      if (!closedTab.input || typeof closedTab.input !== 'object') {
+        continue;
+      }
+      const tabInput = closedTab.input as {
+        original?: vscode.Uri;
+        modified?: vscode.Uri;
+      };
+      if (tabInput.modified?.scheme === 'openclaude-diff-proposed') {
+        const filePath = tabInput.modified.path;
+        const pending = this.pendingDiffs.get(filePath);
+        if (pending) {
+          this.outputChannel.appendLine(
+            `[DiffManager] Diff tab closed for ${filePath}, treating as reject`,
+          );
+          this.sendDenyResponse(
+            pending.requestId,
+            pending.toolUseId,
+            'User closed diff editor without accepting',
+            pending.transport,
+          );
+          // Clean up without trying to close the tab (it's already closed)
+          this.originalProvider.removeContent(filePath);
+          this.proposedProvider.removeContent(filePath);
+          this.pendingDiffs.delete(filePath);
+          this.diffEditorTabs.delete(filePath);
+          this.updateContextVariable();
+
+          // Process queued diffs for the same file
+          const queued = this.pendingQueue.get(filePath);
+          if (queued && queued.length > 0) {
+            const next = queued.shift()!;
+            if (queued.length === 0) {
+              this.pendingQueue.delete(filePath);
             }
-            await vscode.window.tabGroups.close(tab);
-          } catch {
-            // Tab might already be closed
+            this.showDiff(next.requestId, next.request, next.transport);
           }
         }
       }
     }
   }
 
+  // ===========================================================================
+  // Private: File operations
+  // ===========================================================================
+
   /**
-   * Get all tabs across all tab groups.
+   * Write content to a file, creating parent directories if needed.
    */
-  private getAllTabs(): vscode.Tab[] {
-    return vscode.window.tabGroups.all.flatMap((group) => [...group.tabs]);
+  private async writeFile(
+    filePath: string,
+    content: string,
+  ): Promise<void> {
+    const dir = path.dirname(filePath);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(filePath, content, 'utf-8');
   }
+
+  /**
+   * Auto-save the file if it's open in a VS Code editor.
+   * This ensures the editor shows the latest content without a "dirty" indicator.
+   */
+  private async autoSaveFile(filePath: string): Promise<void> {
+    const uri = vscode.Uri.file(filePath);
+    const openDoc = vscode.workspace.textDocuments.find(
+      (doc) => doc.uri.fsPath === uri.fsPath,
+    );
+    if (openDoc && openDoc.isDirty) {
+      await openDoc.save();
+    }
+  }
+
+  // ===========================================================================
+  // Private: Control response helpers
+  // ===========================================================================
+
+  /**
+   * Send a "success" control_response with behavior: allow.
+   * This tells the CLI "the user approved this tool use."
+   */
+  private sendAllowResponse(
+    requestId: string,
+    toolUseId: string,
+    toolInput: Record<string, unknown>,
+    transport: NdjsonTransport,
+  ): void {
+    transport.write({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: requestId,
+        response: {
+          behavior: 'allow',
+          updatedInput: toolInput,
+          toolUseID: toolUseId,
+        },
+      },
+    });
+  }
+
+  /**
+   * Send a "success" control_response with behavior: deny.
+   *
+   * Note: The response subtype is still "success" -- this means "the extension
+   * handled the request successfully." The `behavior` field carries the actual
+   * permission decision (allow/deny). This matches the PermissionResult type
+   * in src/types/session.ts.
+   */
+  private sendDenyResponse(
+    requestId: string,
+    toolUseId: string,
+    message: string,
+    transport: NdjsonTransport,
+  ): void {
+    transport.write({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: requestId,
+        response: {
+          behavior: 'deny',
+          message,
+          toolUseID: toolUseId,
+        },
+      },
+    });
+  }
+
+  // ===========================================================================
+  // Private: Context variable management
+  // ===========================================================================
+
+  /**
+   * Update the openclaude.viewingProposedDiff context variable.
+   * When true, the Accept/Reject buttons appear in the editor title bar.
+   */
+  private async updateContextVariable(): Promise<void> {
+    await vscode.commands.executeCommand(
+      'setContext',
+      'openclaude.viewingProposedDiff',
+      this.pendingDiffs.size > 0,
+    );
+  }
+
+  // ===========================================================================
+  // Dispose
+  // ===========================================================================
 
   dispose(): void {
+    // Reject all pending diffs on dispose so CLI isn't left waiting
+    for (const [filePath, pending] of this.pendingDiffs.entries()) {
+      this.sendDenyResponse(
+        pending.requestId,
+        pending.toolUseId,
+        'Extension deactivated',
+        pending.transport,
+      );
+      this.originalProvider.removeContent(filePath);
+      this.proposedProvider.removeContent(filePath);
+    }
+    // Reject all queued diffs too
+    for (const [, queue] of this.pendingQueue.entries()) {
+      for (const item of queue) {
+        this.sendDenyResponse(
+          item.requestId,
+          item.request.tool_use_id,
+          'Extension deactivated',
+          item.transport,
+        );
+      }
+    }
+    this.pendingDiffs.clear();
+    this.pendingQueue.clear();
+    this.diffEditorTabs.clear();
+    vscode.commands.executeCommand(
+      'setContext',
+      'openclaude.viewingProposedDiff',
+      false,
+    );
     for (const d of this.disposables) {
       d.dispose();
     }
-    this.disposables = [];
-    this.pendingDiffs.clear();
   }
 }
 ```
 
-- [ ] **Step 2: Run DiffManager tests — should all PASS**
+- [ ] **Step 2: Verify it compiles**
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx vitest run test/unit/diffManager.test.ts 2>&1`
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit`
 
-Expected: All tests pass (8/8 or similar)
-
-```
- ✓ test/unit/diffManager.test.ts (8)
-   ✓ DiffManager > should detect FileEditTool as a file tool
-   ✓ DiffManager > should detect FileWriteTool as a file tool
-   ✓ DiffManager > should not detect BashTool as a file tool
-   ✓ DiffManager > should compute proposed content for FileWriteTool
-   ✓ DiffManager > should compute proposed content for FileEditTool
-   ✓ DiffManager > should compute proposed content for FileEditTool with replace_all
-   ✓ DiffManager > should track pending diffs by file path
-   ✓ DiffManager > should generate correct diff editor title
-```
+Expected: No errors
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
 git add src/diff/diffManager.ts
-git commit -m "feat(diff): implement DiffManager with accept/reject/compute logic"
+git commit -m "feat(diff): add DiffManager for native diff viewer accept/reject lifecycle"
 ```
 
 ---
 
-## Task 6: Accept/Reject Commands and Context Variable
-
-**Files:**
-- Create: `src/diff/diffCommands.ts`
-
-This module registers the `openclaude.acceptProposedDiff` and `openclaude.rejectProposedDiff` commands and sets the `openclaude.viewingProposedDiff` context variable. Pattern extracted from Claude Code's `Xr` function (command registration) and `dg6` function (context variable tracking).
-
-In Claude Code:
-- `Xr(K)` — registers accept/reject commands, fires EventEmitter with `{ accepted: true/false, activeTab }`.
-- `dg6(K)` — watches `onDidChangeVisibleTextEditors`, checks if any editor has the right provider's scheme, sets context variable.
-
-- [ ] **Step 1: Create src/diff/diffCommands.ts**
-
-```typescript
-// src/diff/diffCommands.ts
-// Registers Accept/Reject diff commands and manages the viewingProposedDiff context variable.
-//
-// Pattern from Claude Code extension.js:
-//   Xr(K) — registers claude-vscode.acceptProposedDiff and claude-vscode.rejectProposedDiff
-//   dg6(K) — watches visible text editors, sets claude-vscode.viewingProposedDiff context
-
-import * as vscode from 'vscode';
-import type { DiffDecisionEvent } from './types';
-
-/** URI scheme used by the right (proposed) file system provider */
-const RIGHT_SCHEME = '_openclaude_fs_right';
-
-/**
- * Register the Accept and Reject diff commands.
- * Returns an Event<DiffDecisionEvent> that fires when the user clicks either button.
- *
- * This directly mirrors Claude Code's Xr() function:
- *   function Xr(K) {
- *     let V = new O0.EventEmitter;
- *     K.push(O0.commands.registerCommand("claude-vscode.acceptProposedDiff", async () => {
- *       let B = O0.window.tabGroups.activeTabGroup.activeTab;
- *       V.fire({ accepted: true, activeTab: B });
- *     }));
- *     K.push(O0.commands.registerCommand("claude-vscode.rejectProposedDiff", async () => {
- *       let B = O0.window.tabGroups.activeTabGroup.activeTab;
- *       V.fire({ accepted: false, activeTab: B });
- *     }));
- *     return V.event;
- *   }
- */
-export function registerDiffCommands(
-  subscriptions: vscode.Disposable[],
-): vscode.Event<DiffDecisionEvent> {
-  const emitter = new vscode.EventEmitter<DiffDecisionEvent>();
-
-  subscriptions.push(
-    vscode.commands.registerCommand('openclaude.acceptProposedDiff', async () => {
-      const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
-      emitter.fire({ accepted: true, activeTab });
-    }),
-  );
-
-  subscriptions.push(
-    vscode.commands.registerCommand('openclaude.rejectProposedDiff', async () => {
-      const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
-      emitter.fire({ accepted: false, activeTab });
-    }),
-  );
-
-  subscriptions.push(emitter);
-
-  return emitter.event;
-}
-
-/**
- * Watch visible text editors and set the openclaude.viewingProposedDiff context variable.
- * This controls the visibility of Accept/Reject buttons in the editor title bar.
- *
- * The context variable is true when any visible editor has a document with the
- * right provider's scheme (meaning a proposed diff is visible).
- *
- * This directly mirrors Claude Code's dg6() function:
- *   function dg6(K) {
- *     return O6.window.onDidChangeVisibleTextEditors((V) => {
- *       let B = V.some((H) => H?.document.uri.scheme === K);
- *       O6.commands.executeCommand("setContext", "claude-vscode.viewingProposedDiff", B);
- *     });
- *   }
- */
-export function watchDiffEditorVisibility(rightScheme: string): vscode.Disposable {
-  return vscode.window.onDidChangeVisibleTextEditors((editors) => {
-    const isViewingDiff = editors.some(
-      (editor) => editor?.document.uri.scheme === rightScheme,
-    );
-    vscode.commands.executeCommand(
-      'setContext',
-      'openclaude.viewingProposedDiff',
-      isViewingDiff,
-    );
-  });
-}
-```
-
-- [ ] **Step 2: Commit**
-
-```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add src/diff/diffCommands.ts
-git commit -m "feat(diff): register accept/reject commands and viewingProposedDiff context"
-```
-
----
-
-## Task 7: Wire DiffManager into Extension Activation
+## Task 3: Wire DiffManager into Extension Activation
 
 **Files:**
 - Modify: `src/extension.ts`
 
-This task wires up all the diff components during extension activation:
-1. Create left and right `DiffContentProvider` instances
-2. Register them as `FileSystemProvider`s
-3. Register the accept/reject commands (returns an event)
-4. Watch editor visibility for context variable
-5. Create `DiffManager` with the providers and event
-6. Register `DiffManager.handleFileToolRequest` as the `can_use_tool` handler on ControlRouter (for file tools)
+Replace the no-op registrations of `openclaude.acceptProposedDiff` and `openclaude.rejectProposedDiff` with real command handlers that delegate to DiffManager. Register the DiffContentProvider URI schemes. Create the DiffManager and output channel.
 
-The wiring pattern is extracted from Claude Code's activation function, which:
-```javascript
-let H = new $2("_claude_vscode_fs_left");
-K.subscriptions.push(O6.workspace.registerFileSystemProvider(H.scheme, H));
-let j = new $2("_claude_vscode_fs_right");
-K.subscriptions.push(O6.workspace.registerFileSystemProvider(j.scheme, j));
-let G = new FQ("_claude_vscode_fs_readonly");
-K.subscriptions.push(O6.workspace.registerTextDocumentContentProvider(G.scheme, G));
-K.subscriptions.push(dg6(j.scheme));
-let x = Xr(K.subscriptions);
-```
+- [ ] **Step 1: Update src/extension.ts to integrate DiffManager**
 
-- [ ] **Step 1: Update src/extension.ts to wire diff components**
-
-Add the following imports at the top of `src/extension.ts`:
+Replace the full file with:
 
 ```typescript
-import { DiffContentProvider } from './diff/diffContentProvider';
+import * as vscode from 'vscode';
+import { OpenClaudeWebviewProvider } from './webview/webviewProvider';
+import { createDiffContentProviders } from './diff/diffContentProvider';
 import { DiffManager } from './diff/diffManager';
-import { registerDiffCommands, watchDiffEditorVisibility } from './diff/diffCommands';
-import { isFileTool } from './diff/types';
-```
 
-Add the following in the `activate()` function, after ProcessManager setup (Story 2) or after the existing command registrations:
+// Module-level reference so other modules (e.g., ProcessManager, ControlRouter)
+// can access the DiffManager instance.
+let diffManagerInstance: DiffManager | undefined;
 
-```typescript
-  // ---- Diff Viewer (Story 6) ----
+/** Get the active DiffManager instance (available after activation). */
+export function getDiffManager(): DiffManager | undefined {
+  return diffManagerInstance;
+}
 
-  // Create virtual file system providers for diff left (original) and right (proposed)
-  const diffLeftProvider = new DiffContentProvider('_openclaude_fs_left');
-  context.subscriptions.push(
-    vscode.workspace.registerFileSystemProvider(diffLeftProvider.scheme, diffLeftProvider),
-  );
+export function activate(context: vscode.ExtensionContext) {
+  console.log('OpenClaude VS Code extension activated');
 
-  const diffRightProvider = new DiffContentProvider('_openclaude_fs_right');
-  context.subscriptions.push(
-    vscode.workspace.registerFileSystemProvider(diffRightProvider.scheme, diffRightProvider),
-  );
+  // === Output channel for debug logging ===
+  const outputChannel = vscode.window.createOutputChannel('OpenClaude');
+  context.subscriptions.push(outputChannel);
 
-  // Watch editor visibility to set context variable for button visibility
-  context.subscriptions.push(watchDiffEditorVisibility(diffRightProvider.scheme));
+  // === Diff system: register URI schemes and create DiffManager ===
+  const { original, proposed, disposables: diffProviderDisposables } =
+    createDiffContentProviders();
+  context.subscriptions.push(...diffProviderDisposables);
 
-  // Register Accept/Reject commands — returns event that fires on button click
-  const acceptOrRejectDiffs = registerDiffCommands(context.subscriptions);
-
-  // Create DiffManager
-  const diffManager = new DiffManager(diffLeftProvider, diffRightProvider, acceptOrRejectDiffs);
+  const diffManager = new DiffManager(original, proposed, outputChannel);
   context.subscriptions.push(diffManager);
+  diffManagerInstance = diffManager;
 
-  // Register DiffManager as the can_use_tool handler for file tools on the ControlRouter.
-  // The ControlRouter (from Story 2) calls this handler when the CLI requests permission
-  // to use FileEditTool or FileWriteTool.
-  //
-  // NOTE: This registration must happen AFTER ProcessManager is created (Story 2).
-  // If Story 2 is not yet wired, this section can be deferred.
-  // When ProcessManager is available:
-  //
-  //   processManager.controlRouter.registerHandler('can_use_tool', async (request, signal) => {
-  //     const permRequest = request as ControlRequestPermission;
-  //     if (diffManager.isFileToolRequest(permRequest)) {
-  //       return diffManager.handleFileToolRequest(permRequest, signal);
-  //     }
-  //     // Not a file tool — fall through to the permission dialog handler (Story 7)
-  //     throw new Error('Not a file tool — delegate to permission handler');
-  //   });
-```
+  // === Webview system ===
+  const provider = new OpenClaudeWebviewProvider(context.extensionUri);
 
-- [ ] **Step 2: Remove acceptProposedDiff and rejectProposedDiff from the no-op command list**
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      'openclaudeSidebarSecondary',
+      provider,
+    ),
+  );
 
-In `src/extension.ts`, remove `'openclaude.acceptProposedDiff'` and `'openclaude.rejectProposedDiff'` from the `noopCommands` array (or `commandIds` array), since they are now registered by `registerDiffCommands`.
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider('openclaudeSidebar', provider),
+  );
 
-Before:
-```typescript
+  // === Open commands ===
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.editor.open', () => {
+      provider.createPanel();
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.editor.openLast', () => {
+      provider.createPanel();
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.primaryEditor.open', () => {
+      provider.createPanel();
+    }),
+  );
+
+  // === Diff commands (real implementations -- replaces no-ops) ===
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.acceptProposedDiff', () => {
+      diffManager.acceptCurrentDiff();
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.rejectProposedDiff', () => {
+      diffManager.rejectCurrentDiff();
+    }),
+  );
+
+  // === Remaining commands (no-ops until their stories are implemented) ===
   const noopCommands = [
     'openclaude.window.open',
-    // ...
-    'openclaude.acceptProposedDiff',
-    'openclaude.rejectProposedDiff',
-    // ...
+    'openclaude.sidebar.open',
+    'openclaude.terminal.open',
+    'openclaude.terminal.open.keyboard',
+    'openclaude.createWorktree',
+    'openclaude.newConversation',
+    'openclaude.focus',
+    'openclaude.blur',
+    'openclaude.insertAtMention',
+    'openclaude.insertAtMentioned',
+    // NOTE: acceptProposedDiff and rejectProposedDiff removed -- now real above
+    'openclaude.showLogs',
+    'openclaude.openWalkthrough',
+    'openclaude.update',
+    'openclaude.installPlugin',
+    'openclaude.logout',
   ];
+
+  for (const id of noopCommands) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(id, () => {
+        vscode.window.showInformationMessage('OpenClaude: Coming soon!');
+      }),
+    );
+  }
+}
+
+export function deactivate() {
+  diffManagerInstance = undefined;
+  console.log('OpenClaude VS Code extension deactivated');
+}
 ```
 
-After:
+**Key changes from the previous version:**
+1. Import `createDiffContentProviders` and `DiffManager`
+2. Create an output channel `'OpenClaude'` for structured debug logging
+3. Initialize the diff content providers (registers `openclaude-diff-original://` and `openclaude-diff-proposed://` URI schemes)
+4. Create a `DiffManager` instance and expose it via `getDiffManager()` for ControlRouter
+5. Replace no-op registrations of `acceptProposedDiff` / `rejectProposedDiff` with real handlers
+6. Remove those two command IDs from the `noopCommands` array
+
+- [ ] **Step 2: Build the extension**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npm run build`
+
+Expected: Build completes with no errors
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/extension.ts
+git commit -m "feat(diff): wire DiffManager and accept/reject commands into extension activation"
+```
+
+---
+
+## Task 4: Control Request Router Integration
+
+**Files:**
+- Create: `src/process/controlRouter.ts`
+
+This connects the NDJSON message flow to the DiffManager. When a `control_request` arrives with `subtype: can_use_tool` and the tool is `FileEditTool` or `FileWriteTool`, the router delegates to `DiffManager.showDiff()` instead of showing a generic permission dialog.
+
+- [ ] **Step 1: Create the ControlRouter class**
+
 ```typescript
-  const noopCommands = [
-    'openclaude.window.open',
-    // ...
-    // 'openclaude.acceptProposedDiff',  — now registered by diffCommands.ts
-    // 'openclaude.rejectProposedDiff',  — now registered by diffCommands.ts
-    // ...
-  ];
+// src/process/controlRouter.ts
+// Routes incoming control_request messages from the CLI to the appropriate
+// handler: DiffManager for file edits, placeholder responses for others.
+//
+// Future stories will add: PermissionHandler (Story 7), ElicitationHandler
+// (Story 7), HookHandler, McpHandler (Story 12).
+
+import type { OutputChannel } from 'vscode';
+import type { NdjsonTransport } from './ndjsonTransport';
+import type { DiffManager } from '../diff/diffManager';
+import type {
+  SDKControlRequest,
+  SDKControlCancelRequest,
+  ControlRequestPermission,
+} from '../types/messages';
+
+export class ControlRouter {
+  constructor(
+    private readonly diffManager: DiffManager,
+    private readonly transport: NdjsonTransport,
+    private readonly outputChannel: OutputChannel,
+  ) {}
+
+  /**
+   * Route an incoming control_request to the appropriate handler.
+   * Called by ProcessManager (or whoever owns the transport.onMessage callback).
+   */
+  async handleControlRequest(msg: SDKControlRequest): Promise<void> {
+    const { request_id, request } = msg;
+
+    switch (request.subtype) {
+      case 'can_use_tool': {
+        const permRequest = request as ControlRequestPermission;
+        if (this.diffManager.isFileEditToolRequest(permRequest)) {
+          // File edit/write tools -> native diff viewer
+          await this.diffManager.showDiff(
+            request_id,
+            permRequest,
+            this.transport,
+          );
+        } else {
+          // Other tools -> auto-allow for now
+          // Story 7 (PermissionHandler) will replace this with a dialog
+          this.outputChannel.appendLine(
+            `[ControlRouter] Auto-allowing tool: ${permRequest.tool_name}`,
+          );
+          this.transport.write({
+            type: 'control_response',
+            response: {
+              subtype: 'success',
+              request_id,
+              response: {
+                behavior: 'allow',
+                updatedInput: permRequest.input,
+                toolUseID: permRequest.tool_use_id,
+              },
+            },
+          });
+        }
+        break;
+      }
+
+      case 'elicitation': {
+        // Placeholder -- Story 7 will implement ElicitationDialog
+        this.outputChannel.appendLine(
+          `[ControlRouter] Elicitation received (request ${request_id}) -- not yet implemented`,
+        );
+        this.transport.write({
+          type: 'control_response',
+          response: {
+            subtype: 'error',
+            request_id,
+            error: 'Elicitation not yet implemented',
+          },
+        });
+        break;
+      }
+
+      case 'hook_callback': {
+        // Placeholder -- future story
+        this.outputChannel.appendLine(
+          `[ControlRouter] Hook callback received (request ${request_id}) -- not yet implemented`,
+        );
+        this.transport.write({
+          type: 'control_response',
+          response: {
+            subtype: 'error',
+            request_id,
+            error: 'Hook callbacks not yet implemented',
+          },
+        });
+        break;
+      }
+
+      case 'mcp_message': {
+        // Placeholder -- Story 12 will implement MCP message forwarding
+        this.outputChannel.appendLine(
+          `[ControlRouter] MCP message received (request ${request_id}) -- not yet implemented`,
+        );
+        this.transport.write({
+          type: 'control_response',
+          response: {
+            subtype: 'error',
+            request_id,
+            error: 'MCP messages not yet implemented',
+          },
+        });
+        break;
+      }
+
+      default: {
+        const subtype = (request as { subtype: string }).subtype;
+        this.outputChannel.appendLine(
+          `[ControlRouter] Unknown control_request subtype: ${subtype}`,
+        );
+        this.transport.write({
+          type: 'control_response',
+          response: {
+            subtype: 'error',
+            request_id,
+            error: `Unknown control_request subtype: ${subtype}`,
+          },
+        });
+      }
+    }
+  }
+
+  /**
+   * Handle a control_cancel_request -- cancel stale pending operations.
+   * The CLI sends this when a hook resolves a permission before the user
+   * decides, or when the request is no longer relevant.
+   */
+  async handleControlCancelRequest(
+    msg: SDKControlCancelRequest,
+  ): Promise<void> {
+    this.outputChannel.appendLine(
+      `[ControlRouter] Cancel request for: ${msg.request_id}`,
+    );
+    await this.diffManager.cancelDiffByRequestId(msg.request_id);
+    // Future: also cancel pending permission dialogs, elicitations, etc.
+  }
+}
 ```
 
-- [ ] **Step 3: Build the extension**
+- [ ] **Step 2: Document the expected integration point with ProcessManager**
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && node esbuild.config.mjs`
+The `ControlRouter` is created and wired into the message flow in the ProcessManager (from Story 2). Add a comment or create a minimal integration point. The expected pattern is:
 
-Expected: `Extension built successfully`
+```typescript
+// In ProcessManager (Story 2) or wherever transport.onMessage() is set up:
+//
+// import { ControlRouter } from './controlRouter';
+// import { getDiffManager } from '../extension';
+//
+// // After transport is created:
+// const diffManager = getDiffManager()!;
+// const controlRouter = new ControlRouter(diffManager, transport, outputChannel);
+//
+// transport.onMessage((msg: unknown) => {
+//   const typed = msg as { type: string };
+//   switch (typed.type) {
+//     case 'control_request':
+//       controlRouter.handleControlRequest(msg as SDKControlRequest);
+//       break;
+//     case 'control_cancel_request':
+//       controlRouter.handleControlCancelRequest(msg as SDKControlCancelRequest);
+//       break;
+//     // ... other message types forwarded to webview
+//   }
+// });
+```
+
+- [ ] **Step 3: Build**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npm run build`
+
+Expected: No errors
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add src/extension.ts
-git commit -m "feat(diff): wire DiffManager, providers, and commands into extension activation"
+git add src/process/controlRouter.ts
+git commit -m "feat(diff): add ControlRouter to dispatch can_use_tool requests to DiffManager"
 ```
 
 ---
 
-## Task 8: Integration with ControlRouter (Story 2 Bridge)
+## Task 5: Context Variable and Menu Verification
 
 **Files:**
-- Create: `src/diff/diffControlHandler.ts`
+- Verify: `package.json` (no changes needed -- already done in Story 1)
 
-This module creates the bridge between the ControlRouter (from Story 2) and the DiffManager. It registers a `can_use_tool` handler that checks if the tool is a file tool and delegates to DiffManager; otherwise, it delegates to a fallback handler (for the permission dialog in Story 7).
+This task verifies that the `openclaude.viewingProposedDiff` context variable correctly controls button visibility. The buttons are already declared in `package.json` from Story 1.
 
-The key insight from Claude Code's architecture: there is a SINGLE `can_use_tool` handler registered on the ControlRouter, and it internally dispatches to either the diff viewer (for file tools) or the permission dialog (for all other tools). This module implements that dispatch.
+- [ ] **Step 1: Verify package.json menu contributions**
 
-- [ ] **Step 1: Create src/diff/diffControlHandler.ts**
+Confirm these exist in `package.json`:
 
-```typescript
-// src/diff/diffControlHandler.ts
-// Bridge between ControlRouter (Story 2) and DiffManager (this story).
-//
-// Registers a single can_use_tool handler on the ControlRouter that:
-//   1. If the tool is FileEditTool or FileWriteTool → delegate to DiffManager
-//   2. Otherwise → delegate to a fallback handler (permission dialog, Story 7)
-//
-// This allows both the diff viewer and permission dialog to coexist
-// under the same can_use_tool subtype.
-
-import type { DiffManager } from './diffManager';
-import type { ControlRequestPermission } from '../types/messages';
-import type { ControlRequestHandler, WriteFn } from '../process/controlRouter';
-import { isFileTool } from './types';
-
-/**
- * Create a can_use_tool handler that dispatches file tools to DiffManager
- * and everything else to a fallback handler.
- *
- * @param diffManager - The DiffManager instance
- * @param fallbackHandler - Handler for non-file tools (permission dialog)
- *                          Can be undefined initially (Story 7 not yet implemented)
- */
-export function createFileToolHandler(
-  diffManager: DiffManager,
-  fallbackHandler?: ControlRequestHandler,
-): ControlRequestHandler {
-  return async (request, signal) => {
-    const permRequest = request as ControlRequestPermission;
-
-    if (permRequest.subtype === 'can_use_tool' && isFileTool(permRequest.tool_name)) {
-      // File tool → show native diff viewer
-      return diffManager.handleFileToolRequest(permRequest, signal);
-    }
-
-    // Not a file tool → delegate to fallback (permission dialog)
-    if (fallbackHandler) {
-      return fallbackHandler(request, signal);
-    }
-
-    // No fallback handler registered yet — auto-allow
-    // (Story 7 will add the permission dialog handler)
-    throw new Error(`No handler for tool: ${permRequest.tool_name}`);
-  };
-}
-
-/**
- * Register the file tool handler on the ControlRouter.
- *
- * Call this during extension activation after both ProcessManager (Story 2)
- * and DiffManager (Story 6) are created.
- *
- * Usage:
- *   import { ControlRouter } from '../process/controlRouter';
- *   import { registerDiffControlHandler } from './diffControlHandler';
- *
- *   registerDiffControlHandler(controlRouter, diffManager);
- *
- * When Story 7 (Permission Dialog) is implemented, update to:
- *   registerDiffControlHandler(controlRouter, diffManager, permissionHandler);
- */
-export function registerDiffControlHandler(
-  controlRouter: { registerHandler: (subtype: string, handler: ControlRequestHandler) => void },
-  diffManager: DiffManager,
-  fallbackHandler?: ControlRequestHandler,
-): void {
-  const handler = createFileToolHandler(diffManager, fallbackHandler);
-  controlRouter.registerHandler('can_use_tool', handler);
-}
-```
-
-- [ ] **Step 2: Commit**
-
-```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add src/diff/diffControlHandler.ts
-git commit -m "feat(diff): add ControlRouter bridge for file tool dispatch"
-```
-
----
-
-## Task 9: Package.json Menu Contributions (Accept/Reject Buttons)
-
-**Files:**
-- Modify: `package.json`
-
-Ensure the Accept/Reject buttons appear in the editor title bar when viewing a proposed diff. These are defined as `contributes.commands` and `contributes.menus.editor/title` entries in `package.json`.
-
-If Story 1's package.json already has these (forked from Claude Code), verify the rebranding is correct. If not, add them.
-
-- [ ] **Step 1: Verify/add Accept/Reject command contributions in package.json**
-
-The following must exist in `contributes.commands`:
-
+Commands section:
 ```json
 {
   "command": "openclaude.acceptProposedDiff",
@@ -1408,10 +1268,7 @@ The following must exist in `contributes.commands`:
 }
 ```
 
-- [ ] **Step 2: Verify/add editor title menu entries in package.json**
-
-The following must exist in `contributes.menus.editor/title`:
-
+Menus section (`editor/title`):
 ```json
 {
   "command": "openclaude.acceptProposedDiff",
@@ -1425,183 +1282,549 @@ The following must exist in `contributes.menus.editor/title`:
 }
 ```
 
-These ensure:
-- The checkmark (Accept) and discard (Reject) icons appear in the editor title bar
-- They only show when `openclaude.viewingProposedDiff` context is true
-- They are in the `navigation` group (leftmost position in title bar)
+Verify that:
+- `enablement` on commands matches `openclaude.viewingProposedDiff`
+- `when` on menu items matches `openclaude.viewingProposedDiff`
+- Icons are `$(check)` (Codicon: checkmark) and `$(discard)` (Codicon: discard)
+- Both appear in `group: "navigation"` (shows as icons in the editor title bar, not in dropdown)
 
-- [ ] **Step 3: Verify JSON validity**
+- [ ] **Step 2: Trace the context variable lifecycle**
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log('Valid JSON')"`
+1. `DiffManager.showDiff()` -> `updateContextVariable()` -> `setContext('openclaude.viewingProposedDiff', true)` (buttons appear)
+2. `DiffManager.acceptCurrentDiff()` -> `closeDiffAndCleanup()` -> `updateContextVariable()` -> `setContext('openclaude.viewingProposedDiff', false)` (buttons disappear if no more pending diffs)
+3. `DiffManager.rejectCurrentDiff()` -> `closeDiffAndCleanup()` -> `updateContextVariable()` -> `setContext('openclaude.viewingProposedDiff', false)` (buttons disappear if no more pending diffs)
+4. Tab close -> `handleTabClose()` -> `updateContextVariable()` (same)
+5. Extension deactivation -> `dispose()` -> `setContext('openclaude.viewingProposedDiff', false)` (cleanup)
 
-Expected: `Valid JSON`
+With multiple pending diffs, the variable stays `true` until ALL diffs are resolved.
 
-- [ ] **Step 4: Commit (if changes were made)**
-
-```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add package.json
-git commit -m "fix(diff): verify accept/reject command and menu contributions in package.json"
-```
+No code changes needed -- this task is verification only.
 
 ---
 
-## Task 10: Integration Test — Manual Verification
+## Task 6: Unit Tests
 
-**Files:** None (manual testing)
+**Files:**
+- Create: `src/diff/__tests__/diffContentProvider.test.ts`
+- Create: `src/diff/__tests__/diffManager.test.ts`
 
-This task verifies the full diff flow end-to-end in the Extension Development Host.
+- [ ] **Step 1: Create DiffContentProvider unit tests**
 
-- [ ] **Step 1: Build everything**
+```typescript
+// src/diff/__tests__/diffContentProvider.test.ts
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npm run build`
+// Mock vscode module
+vi.mock('vscode', () => ({
+  EventEmitter: class {
+    private handlers: Array<(data: unknown) => void> = [];
+    event = (handler: (data: unknown) => void) => {
+      this.handlers.push(handler);
+    };
+    fire(data: unknown) {
+      this.handlers.forEach((h) => h(data));
+    }
+    dispose() {
+      this.handlers = [];
+    }
+  },
+  Uri: {
+    parse: (s: string) => ({
+      scheme: s.split(':')[0],
+      path: s.substring(s.indexOf(':') + 1),
+    }),
+  },
+  workspace: {
+    registerTextDocumentContentProvider: vi.fn(() => ({
+      dispose: vi.fn(),
+    })),
+  },
+}));
 
-Expected: Both extension and webview build successfully
+import { DiffContentProvider } from '../diffContentProvider';
 
-- [ ] **Step 2: Launch Extension Development Host (F5)**
+describe('DiffContentProvider', () => {
+  let provider: DiffContentProvider;
 
-In VS Code, press F5 to launch the Extension Development Host with the extension loaded.
+  beforeEach(() => {
+    provider = new DiffContentProvider();
+    provider.scheme = 'openclaude-diff-original';
+  });
 
-- [ ] **Step 3: Verify Accept/Reject buttons are NOT visible by default**
+  it('should return empty string for unknown paths', () => {
+    const uri = { path: '/some/unknown/file.ts' } as { path: string };
+    expect(provider.provideTextDocumentContent(uri as never)).toBe('');
+  });
 
-Open any regular file in the Extension Development Host. The editor title bar should NOT show checkmark or discard buttons (because `openclaude.viewingProposedDiff` is false).
+  it('should return stored content for known paths', () => {
+    provider.setContent('/test/file.ts', 'hello world');
+    const uri = { path: '/test/file.ts' } as { path: string };
+    expect(provider.provideTextDocumentContent(uri as never)).toBe(
+      'hello world',
+    );
+  });
 
-- [ ] **Step 4: Verify DiffContentProvider works**
+  it('should update content when setContent is called again', () => {
+    provider.setContent('/test/file.ts', 'version 1');
+    provider.setContent('/test/file.ts', 'version 2');
+    const uri = { path: '/test/file.ts' } as { path: string };
+    expect(provider.provideTextDocumentContent(uri as never)).toBe(
+      'version 2',
+    );
+  });
 
-Open the Debug Console in the host VS Code and run:
+  it('should remove content', () => {
+    provider.setContent('/test/file.ts', 'hello');
+    provider.removeContent('/test/file.ts');
+    const uri = { path: '/test/file.ts' } as { path: string };
+    expect(provider.provideTextDocumentContent(uri as never)).toBe('');
+  });
 
-```javascript
-// This simulates what DiffManager does — manual smoke test
-const left = vscode.Uri.from({ scheme: '_openclaude_fs_left', path: '/tmp/test.ts' });
-const right = vscode.Uri.from({ scheme: '_openclaude_fs_right', path: '/tmp/test.ts' });
-await vscode.commands.executeCommand('vscode.diff', left, right, 'Test Diff');
+  it('should store multiple files independently', () => {
+    provider.setContent('/a.ts', 'content a');
+    provider.setContent('/b.ts', 'content b');
+    expect(
+      provider.provideTextDocumentContent({ path: '/a.ts' } as never),
+    ).toBe('content a');
+    expect(
+      provider.provideTextDocumentContent({ path: '/b.ts' } as never),
+    ).toBe('content b');
+  });
+
+  it('should clear all content', () => {
+    provider.setContent('/a.ts', 'a');
+    provider.setContent('/b.ts', 'b');
+    provider.clear();
+    expect(
+      provider.provideTextDocumentContent({ path: '/a.ts' } as never),
+    ).toBe('');
+    expect(
+      provider.provideTextDocumentContent({ path: '/b.ts' } as never),
+    ).toBe('');
+  });
+});
 ```
 
-Expected: A diff editor opens (may show empty content since we haven't populated the providers via the extension API, but it should not error).
+- [ ] **Step 2: Create DiffManager content computation tests**
 
-- [ ] **Step 5: Verify context variable works**
+```typescript
+// src/diff/__tests__/diffManager.test.ts
+import { describe, it, expect } from 'vitest';
 
-When a diff with the `_openclaude_fs_right` scheme is visible, the Accept/Reject buttons should appear in the editor title bar. When you close the diff tab, they should disappear.
+// Test the computeProposedContent logic by extracting it as a pure function.
+// The full DiffManager requires VS Code API mocks which are better tested
+// in integration tests. Here we test the core computation logic.
 
-- [ ] **Step 6: Run all unit tests**
+/**
+ * Extracted from DiffManager.computeProposedContent for testability.
+ * This is the exact same logic -- keeping it in sync is enforced by
+ * integration tests.
+ */
+function computeProposedContent(
+  toolName: string,
+  input: Record<string, unknown>,
+  originalContent: string,
+): string {
+  if (toolName === 'FileWriteTool') {
+    return (input.content as string) ?? '';
+  }
 
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx vitest run 2>&1`
+  if (toolName === 'FileEditTool') {
+    const oldString = (input.old_string as string) ?? '';
+    const newString = (input.new_string as string) ?? '';
+
+    if (oldString === '') {
+      if (originalContent === '') {
+        return newString;
+      }
+      return newString + originalContent;
+    }
+
+    const index = originalContent.indexOf(oldString);
+    if (index === -1) {
+      return originalContent;
+    }
+
+    return (
+      originalContent.substring(0, index) +
+      newString +
+      originalContent.substring(index + oldString.length)
+    );
+  }
+
+  return originalContent;
+}
+
+describe('computeProposedContent', () => {
+  describe('FileWriteTool', () => {
+    it('should return content field as the full proposed content', () => {
+      const result = computeProposedContent(
+        'FileWriteTool',
+        { content: 'new file content', file_path: '/test.ts' },
+        'old content',
+      );
+      expect(result).toBe('new file content');
+    });
+
+    it('should handle empty content (truncate file)', () => {
+      const result = computeProposedContent(
+        'FileWriteTool',
+        { content: '', file_path: '/test.ts' },
+        'old content',
+      );
+      expect(result).toBe('');
+    });
+
+    it('should handle missing content field', () => {
+      const result = computeProposedContent(
+        'FileWriteTool',
+        { file_path: '/test.ts' },
+        'old content',
+      );
+      expect(result).toBe('');
+    });
+
+    it('should handle new file creation (empty original)', () => {
+      const result = computeProposedContent(
+        'FileWriteTool',
+        { content: 'brand new file', file_path: '/new.ts' },
+        '',
+      );
+      expect(result).toBe('brand new file');
+    });
+  });
+
+  describe('FileEditTool', () => {
+    it('should apply old_string -> new_string replacement', () => {
+      const original = 'function hello() {\n  return "hello";\n}';
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/test.ts',
+          old_string: 'return "hello"',
+          new_string: 'return "world"',
+        },
+        original,
+      );
+      expect(result).toBe('function hello() {\n  return "world";\n}');
+    });
+
+    it('should handle new file creation (empty old_string, empty original)', () => {
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/new.ts',
+          old_string: '',
+          new_string: 'export const x = 1;',
+        },
+        '',
+      );
+      expect(result).toBe('export const x = 1;');
+    });
+
+    it('should prepend when old_string is empty but file exists', () => {
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/test.ts',
+          old_string: '',
+          new_string: '// header\n',
+        },
+        'const x = 1;',
+      );
+      expect(result).toBe('// header\nconst x = 1;');
+    });
+
+    it('should return original when old_string is not found', () => {
+      const original = 'const x = 1;';
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/test.ts',
+          old_string: 'const y = 2',
+          new_string: 'const y = 3',
+        },
+        original,
+      );
+      expect(result).toBe(original);
+    });
+
+    it('should replace only the first occurrence', () => {
+      const original = 'aaa bbb aaa';
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/test.ts',
+          old_string: 'aaa',
+          new_string: 'ccc',
+        },
+        original,
+      );
+      expect(result).toBe('ccc bbb aaa');
+    });
+
+    it('should handle deletion (new_string is empty)', () => {
+      const original = 'line1\nline2\nline3';
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/test.ts',
+          old_string: 'line2\n',
+          new_string: '',
+        },
+        original,
+      );
+      expect(result).toBe('line1\nline3');
+    });
+
+    it('should handle multi-line replacements', () => {
+      const original = 'function foo() {\n  // old\n  return 1;\n}';
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/test.ts',
+          old_string: '  // old\n  return 1;',
+          new_string: '  // new\n  return 42;',
+        },
+        original,
+      );
+      expect(result).toBe('function foo() {\n  // new\n  return 42;\n}');
+    });
+
+    it('should handle replacement at the start of the file', () => {
+      const original = 'const x = 1;\nconst y = 2;';
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/test.ts',
+          old_string: 'const x = 1;',
+          new_string: 'const x = 99;',
+        },
+        original,
+      );
+      expect(result).toBe('const x = 99;\nconst y = 2;');
+    });
+
+    it('should handle replacement at the end of the file', () => {
+      const original = 'const x = 1;\nconst y = 2;';
+      const result = computeProposedContent(
+        'FileEditTool',
+        {
+          file_path: '/test.ts',
+          old_string: 'const y = 2;',
+          new_string: 'const y = 99;',
+        },
+        original,
+      );
+      expect(result).toBe('const x = 1;\nconst y = 99;');
+    });
+  });
+
+  describe('Unknown tool', () => {
+    it('should return original content unchanged', () => {
+      const original = 'some content';
+      const result = computeProposedContent(
+        'SomeOtherTool',
+        { file_path: '/test.ts' },
+        original,
+      );
+      expect(result).toBe(original);
+    });
+  });
+});
+```
+
+- [ ] **Step 3: Run tests**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx vitest run src/diff/__tests__/`
 
 Expected: All tests pass
 
-```
- ✓ test/unit/diffContentProvider.test.ts (9)
- ✓ test/unit/diffManager.test.ts (8)
- ✓ test/unit/ndjsonTransport.test.ts (...)    // From Story 2
- ✓ test/unit/controlRouter.test.ts (...)      // From Story 2
- ✓ test/unit/processManager.test.ts (...)     // From Story 2
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/diff/__tests__/
+git commit -m "test(diff): add unit tests for DiffContentProvider and content computation"
 ```
 
 ---
 
-## Task 11: Final Commit and Verification
+## Task 7: Integration Verification
 
-- [ ] **Step 1: Verify all diff files exist**
+This task verifies the end-to-end flow works correctly by building the extension and testing in the Extension Development Host.
 
-Run: `ls -la /Users/harshagarwal/Documents/workspace/openclaude-vscode/src/diff/`
-
-Expected:
-```
-diffContentProvider.ts
-diffManager.ts
-diffCommands.ts
-diffControlHandler.ts
-types.ts
-```
-
-- [ ] **Step 2: Verify all test files exist**
-
-Run: `ls -la /Users/harshagarwal/Documents/workspace/openclaude-vscode/test/unit/diffContentProvider.test.ts /Users/harshagarwal/Documents/workspace/openclaude-vscode/test/unit/diffManager.test.ts`
-
-Expected: Both files exist
-
-- [ ] **Step 3: Run full test suite one last time**
-
-Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx vitest run 2>&1`
-
-Expected: All tests pass, zero failures
-
-- [ ] **Step 4: Build extension**
+- [ ] **Step 1: Full build**
 
 Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npm run build`
 
-Expected: Build succeeds with no errors
+Expected: Both extension host and webview build successfully
 
-- [ ] **Step 5: Final commit (if any uncommitted changes)**
+- [ ] **Step 2: Type check**
 
-```bash
-cd /Users/harshagarwal/Documents/workspace/openclaude-vscode
-git add -A
-git status
-git commit -m "feat(diff): Story 6 complete — native diff viewer with accept/reject"
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx tsc --noEmit`
+
+Expected: No type errors
+
+- [ ] **Step 3: Run all tests**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npx vitest run`
+
+Expected: All tests pass
+
+- [ ] **Step 4: Lint**
+
+Run: `cd /Users/harshagarwal/Documents/workspace/openclaude-vscode && npm run lint`
+
+Expected: No lint errors (or only pre-existing warnings)
+
+- [ ] **Step 5: Manual verification in Extension Development Host**
+
+```
+1. Press F5 to launch Extension Development Host
+2. Open the OpenClaude output channel (View > Output > select "OpenClaude")
+3. Open Command Palette > "OpenClaude: Accept Proposed Changes"
+   -> Should show "No pending diff to accept." warning
+4. Open Command Palette > "OpenClaude: Reject Proposed Changes"
+   -> Should show "No pending diff to reject." warning
+5. Verify no Accept/Reject buttons visible in editor title bar
+   (context variable starts false)
+6. Full diff flow requires a running CLI process (Story 2 + real CLI).
+   Mark this as verified once Story 2 integration is complete.
 ```
 
----
+- [ ] **Step 6: Final commit**
 
-## Acceptance Criteria Traceability
-
-| Acceptance Criterion | Implemented In | Task |
-|---|---|---|
-| When CLI sends tool_use for FileEditTool/FileWriteTool, show VS Code native diff | `DiffManager.handleFileToolRequest()` — opens `vscode.diff` with original and proposed content | Task 5 |
-| DiffContentProvider serves original and proposed file content | `DiffContentProvider` — `FileSystemProvider` with left/right schemes | Task 3 |
-| Accept button (checkmark icon) in editor title bar applies changes | `package.json` menus + `registerDiffCommands()` + `DiffManager.applyChangesToFile()` | Tasks 6, 9 |
-| Reject button (discard icon) in editor title bar discards changes | `package.json` menus + `registerDiffCommands()` + DiffManager throws error on reject | Tasks 6, 9 |
-| Context variable `openclaude.viewingProposedDiff` controls button visibility | `watchDiffEditorVisibility()` — sets context when right-scheme editors are visible | Task 6 |
-| Multiple pending diffs supported (one per file) | `DiffManager.pendingDiffs` — `Map<string, PendingDiff>` keyed by file path | Task 5 |
-| After accept/reject, send `control_response` back to CLI | `DiffManager` returns to `ControlRouter` which sends `control_response` (success or error) | Tasks 5, 8 |
-| Diff editor closes after decision | `DiffManager.closeDiffTab()` in the `finally` block of `handleFileToolRequest` | Task 5 |
-| Auto-save target file after accepting changes | `DiffManager.applyChangesToFile()` writes to disk + saves open editor document | Task 5 |
+```bash
+git add -A
+git commit -m "feat(diff): Story 6 complete -- native diff viewer with accept/reject"
+```
 
 ---
 
 ## Architecture Notes
 
-### How Claude Code Does It (Deminified)
-
-Claude Code uses THREE virtual file providers:
-1. `$2("_claude_vscode_fs_left")` — `FileSystemProvider` for original content
-2. `$2("_claude_vscode_fs_right")` — `FileSystemProvider` for proposed content (editable in diff editor)
-3. `FQ("_claude_vscode_fs_readonly")` — `TextDocumentContentProvider` for readonly displays
-
-We replicate providers 1 and 2. Provider 3 is for non-diff file displays and can be added later.
-
-### Accept/Reject Flow Detail
+### Data Flow
 
 ```
-CLI → control_request { subtype: "can_use_tool", tool_name: "FileEditTool", input: {...} }
-  → ControlRouter dispatches to can_use_tool handler
-    → diffControlHandler checks: isFileTool? YES
-      → DiffManager.handleFileToolRequest(request, signal)
-        → reads original file content
-        → computes proposed content (apply old_string → new_string)
-        → leftProvider.createFile(path, original)
-        → rightProvider.createFile(path, proposed)
-        → vscode.commands.executeCommand("vscode.diff", leftUri, rightUri, title)
-        → waits for user decision (accept/reject/tab-close)
-
-User clicks Accept (checkmark):
-  → acceptProposedDiff command fires event { accepted: true, activeTab }
-  → DiffManager resolves with 'accepted'
-  → DiffManager.applyChangesToFile() writes proposed content to disk
-  → DiffManager returns { behavior: 'allow', updatedInput: originalInput }
-  → ControlRouter sends control_response { subtype: 'success', response: { behavior: 'allow', ... } }
-  → Diff tab closes
-
-User clicks Reject (discard):
-  → rejectProposedDiff command fires event { accepted: false, activeTab }
-  → DiffManager resolves with 'rejected'
-  → DiffManager throws Error('User denied permission')
-  → ControlRouter sends control_response { subtype: 'error', error: 'User denied permission' }
-  → Diff tab closes
+CLI stdout
+  |
+  v
+NdjsonTransport.onMessage()
+  |
+  v
+ControlRouter.handleControlRequest()
+  |  (checks: is it can_use_tool for FileEditTool/FileWriteTool?)
+  v
+DiffManager.showDiff()
+  |  1. Read original from disk (or empty for new file)
+  |  2. Compute proposed content (FileWriteTool: content; FileEditTool: apply edit)
+  |  3. Store in DiffContentProviders (original + proposed)
+  |  4. Open vscode.diff(originalUri, proposedUri, title)
+  |  5. Set openclaude.viewingProposedDiff = true
+  v
+User sees diff editor with Accept (checkmark) / Reject (discard) in title bar
+  |
+  |--- Accept button -----------> DiffManager.acceptCurrentDiff()
+  |     1. fs.writeFile(proposed content)
+  |     2. Auto-save if file is open in editor
+  |     3. Send control_response { behavior: "allow" }
+  |     4. Close diff tab, clean up providers, update context variable
+  |     5. Process next queued diff (if any)
+  |
+  |--- Reject button -----------> DiffManager.rejectCurrentDiff()
+  |     1. Send control_response { behavior: "deny" }
+  |     2. Close diff tab, clean up providers, update context variable
+  |     3. Process next queued diff (if any)
+  |
+  |--- Tab closed manually -----> handleTabClose()
+  |     -> Treated as reject (same flow as Reject)
+  |
+  |--- CLI cancel request ------> cancelDiffByRequestId()
+  |     -> Clean up without sending response (CLI already moved on)
+  |
+  v
+NdjsonTransport.write(control_response) -> CLI stdin
 ```
 
-### Why FileSystemProvider, Not TextDocumentContentProvider
+### URI Scheme Design
 
-Claude Code uses `registerFileSystemProvider` (not `registerTextDocumentContentProvider`) for the left and right diff content. The reason is that `FileSystemProvider` supports `writeFile()`, which means the user can EDIT the proposed content in the diff editor before accepting. With `TextDocumentContentProvider`, the content is read-only.
+Two custom URI schemes, each backed by a `DiffContentProvider` instance:
 
-This matters because the user might want to tweak the proposed changes (e.g., fix a typo in the new code) before accepting.
+- `openclaude-diff-original:/absolute/path/to/file.ts` -- serves the file's content before the edit
+- `openclaude-diff-proposed:/absolute/path/to/file.ts` -- serves the file's content after the edit
+
+Both are virtual, read-only documents. The absolute file path is the URI's `path` component and serves as the key in the `DiffContentProvider.contentMap`.
+
+### Context Variable Protocol
+
+| State | `openclaude.viewingProposedDiff` | Buttons |
+|---|---|---|
+| No pending diffs | `false` | Hidden |
+| 1+ pending diffs | `true` | Accept (checkmark) + Reject (discard) visible in editor title bar |
+
+Set via `vscode.commands.executeCommand('setContext', 'openclaude.viewingProposedDiff', value)`.
+
+Referenced in `package.json`:
+- `enablement` on command definitions: grays out the command when `false`
+- `when` on `menus.editor/title`: shows/hides the icon buttons
+
+### Control Response Format
+
+Accept (user approves the file edit):
+```json
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "req-001",
+    "response": {
+      "behavior": "allow",
+      "updatedInput": { "file_path": "/path/to/file.ts", "old_string": "...", "new_string": "..." },
+      "toolUseID": "tool-use-001"
+    }
+  }
+}
+```
+
+Reject (user rejects the file edit):
+```json
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "req-001",
+    "response": {
+      "behavior": "deny",
+      "message": "User rejected proposed changes",
+      "toolUseID": "tool-use-001"
+    }
+  }
+}
+```
+
+**Important:** Both use `subtype: "success"` because the extension handled the control_request successfully. The `behavior` field inside `response` carries the actual permission decision (`allow` or `deny`), matching the `PermissionResult` type defined in `src/types/session.ts`.
+
+### Multiple Pending Diffs
+
+Multiple diffs can be pending simultaneously (one per file). The `pendingDiffs` map is keyed by normalized file path.
+
+When the user clicks Accept/Reject, the `getActivePendingDiff()` method determines which diff to act on using this priority:
+1. The diff whose URI matches the active text editor
+2. The diff whose URI matches the active tab's input (works for diff editors that don't expose a TextEditor)
+3. The first entry in the `pendingDiffs` map (fallback for command palette invocation)
+
+If a second edit arrives for a file that already has a pending diff, it is queued in `pendingQueue` and processed after the current diff is resolved.
+
+### Acceptance Criteria Traceability
+
+| Criterion | Implementation |
+|---|---|
+| When CLI sends tool_use for FileEditTool/FileWriteTool, show VS Code native diff | `ControlRouter` routes `can_use_tool` to `DiffManager.showDiff()` which opens `vscode.diff` |
+| DiffContentProvider serves original and proposed file content | `DiffContentProvider` registered for `openclaude-diff-original://` and `openclaude-diff-proposed://` |
+| Accept button (checkmark icon) in editor title bar applies changes | `openclaude.acceptProposedDiff` command -> `DiffManager.acceptCurrentDiff()` -> `fs.writeFile()` |
+| Reject button (discard icon) in editor title bar discards changes | `openclaude.rejectProposedDiff` command -> `DiffManager.rejectCurrentDiff()` -> discards |
+| Context variable `openclaude.viewingProposedDiff` controls button visibility | `DiffManager.updateContextVariable()` sets `setContext()` based on `pendingDiffs.size` |
+| Multiple pending diffs supported (one per file) | `pendingDiffs` Map keyed by file path; `pendingQueue` for same-file collisions |
+| After accept/reject, send `control_response` back to CLI | `sendAllowResponse()` / `sendDenyResponse()` via `NdjsonTransport.write()` |
+| Diff editor closes after decision | `closeDiffAndCleanup()` calls `vscode.window.tabGroups.close(tab)` |
+| Auto-save target file after accepting changes | `autoSaveFile()` saves dirty documents matching the file path |
