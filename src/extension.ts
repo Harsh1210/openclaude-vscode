@@ -524,7 +524,10 @@ export function activate(context: vscode.ExtensionContext) {
       processManager.dispose();
       processManager = undefined;
     }
+    currentSessionId = undefined;
+    crashRestartCount = 0;
     checkpointManager.clear();
+    webviewManager!.broadcast({ type: 'clearMessages' } as never);
     webviewManager!.broadcast({ type: 'process_state', state: 'stopped' });
     webviewManager!.broadcast({ type: 'checkpoint_state', checkpoints: [] });
   });
@@ -995,7 +998,10 @@ export function activate(context: vscode.ExtensionContext) {
         processManager.dispose();
         processManager = undefined;
       }
+      currentSessionId = undefined;
+      crashRestartCount = 0;
       checkpointManager.clear();
+      webviewManager!.broadcast({ type: 'clearMessages' } as never);
       webviewManager!.broadcast({ type: 'process_state', state: 'stopped' });
       webviewManager!.broadcast({ type: 'checkpoint_state', checkpoints: [] });
     }),
