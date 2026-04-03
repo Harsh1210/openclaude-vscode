@@ -341,7 +341,7 @@ export function useChat() {
                 rateLimitType,
                 message: `Rate limited (${rateLimitType}). Resets at ${resetTime}.`,
               });
-              setError(`Rate limited. Resets at ${resetTime}.`);
+              // Don't also setError — ErrorBanner shows rateLimitInfo directly
             }
             break;
           }

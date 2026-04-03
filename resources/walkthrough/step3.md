@@ -8,4 +8,4 @@ Type your message in the input field and press Enter. OpenClaude can help you:
 - Refactor existing code
 - Run terminal commands
 
-Use **@** to mention specific files or folders for context. You can also highlight text in your editor and ask about your selection.
+Use **@** to mention specific files or folders for context. You can also highlight text in your editor first, then open OpenClaude to ask about your selection.

@@ -230,6 +230,7 @@ export function ChatPanel() {
               effortLevel={effortLevel}
               onEffortChange={setEffortLevel}
               toolActivity={toolActivity}
+              permissionMode={permissionMode}
             />
           </div>
         </div>
@@ -301,10 +302,11 @@ interface InputAreaProps {
   onInterrupt: () => void;
   effortLevel: string;
   onEffortChange: (level: string) => void;
+  permissionMode?: string;
   toolActivity: ToolActivity | null;
 }
 
-function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, onEffortChange, toolActivity }: InputAreaProps) {
+function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, onEffortChange, toolActivity, permissionMode }: InputAreaProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [inputValue, setInputValue] = useState('');
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
@@ -368,7 +370,17 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
 
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      doSend();
+      if (isStreaming) {
+        // Claude Code: Enter during streaming interrupts the current turn
+        onInterrupt();
+      } else {
+        doSend();
+      }
+    }
+    // Escape also stops streaming (like Claude Code)
+    if (e.key === 'Escape' && isStreaming) {
+      e.preventDefault();
+      onInterrupt();
     }
   };
 
@@ -491,11 +503,13 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
 
   const placeholder = isStarting
     ? 'Starting OpenClaude...'
-    : isStreaming
-      ? 'Generating...'
-      : 'How can I help? (@ to mention files, / for commands)';
+    : 'How can I help? (@ to mention files, / for commands)';
 
-  const disabled = isStreaming || isStarting;
+  // Claude Code: textarea is NEVER disabled during streaming — user can type while generating
+  // Only disable during initial CLI startup
+  const textareaDisabled = isStarting;
+  // Send button disabled only during startup (not streaming — streaming shows stop button)
+  const sendDisabled = isStarting;
 
   return (
     <div style={{ position: 'relative' }}>
@@ -529,7 +543,7 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
           className="input"
           value={inputValue}
           placeholder={placeholder}
-          disabled={disabled}
+          disabled={textareaDisabled}
           onKeyDown={handleKeyDown}
           onInput={handleInput}
           onChange={() => {/* controlled via onInput */}}
@@ -550,9 +564,10 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
           }}
         />
 
-        {/* Send / Stop button */}
+        {/* Send / Stop button — matches Claude Code's sendButton_gGYT1w exactly */}
         <button
           className="sendButton"
+          disabled={sendDisabled}
           onClick={() => {
             if (isStreaming) {
               onInterrupt();
@@ -560,12 +575,18 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
               doSend();
             }
           }}
-          title={isStreaming ? 'Stop generation' : 'Send message'}
+          title={isStreaming ? 'Stop generation (Escape)' : 'Send message (Enter)'}
+          data-permission-mode={permissionMode}
           style={{
-            cursor: 'pointer',
+            cursor: sendDisabled ? 'not-allowed' : 'pointer',
             display: 'flex',
-            color: isStreaming ? 'var(--app-error-foreground)' : 'var(--app-secondary-foreground)',
-            backgroundColor: 'transparent',
+            // Claude Code: send button is orange bg with white icon; stop button is transparent with colored icon
+            color: isStreaming
+              ? 'var(--app-secondary-foreground)'
+              : 'var(--app-claude-ivory, #fff)',
+            backgroundColor: isStreaming
+              ? 'transparent'
+              : 'var(--app-claude-clay-button-orange, #D97757)',
             border: 'none',
             justifyContent: 'center',
             alignItems: 'center',
@@ -574,15 +595,18 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
             borderRadius: 5,
             flexShrink: 0,
             padding: 0,
+            opacity: sendDisabled ? 0.4 : 1,
           }}
         >
           {isStreaming ? (
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-              <rect x="2" y="2" width="10" height="10" rx="2" />
+            /* Stop icon — square */
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+              <rect x="3" y="3" width="10" height="10" rx="2" />
             </svg>
           ) : (
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-              <path d="M1 7h12M8 2l5 5-5 5" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+            /* Send icon — arrow up */
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M8 12V4M4 8l4-4 4 4" />
             </svg>
           )}
         </button>
@@ -598,17 +622,17 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
         marginTop: 2,
       }}>
         {/* Left: action buttons */}
-        <ToolbarIconButton onClick={handleSlashButtonClick} title="Slash commands" disabled={disabled}>
+        <ToolbarIconButton onClick={handleSlashButtonClick} title="Slash commands" disabled={textareaDisabled}>
           <span style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: 13 }}>/</span>
         </ToolbarIconButton>
 
-        <ToolbarIconButton onClick={handlePaperclipClick} title="Attach file" disabled={disabled}>
+        <ToolbarIconButton onClick={handlePaperclipClick} title="Attach file" disabled={textareaDisabled}>
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
             <path d="M13.5 7.5l-6 6a4 4 0 01-5.66-5.66l6-6a2.5 2.5 0 013.54 3.54l-6 6a1 1 0 01-1.42-1.42l5.5-5.5" />
           </svg>
         </ToolbarIconButton>
 
-        <ToolbarIconButton onClick={handleAddClick} title="Add content" disabled={disabled}>
+        <ToolbarIconButton onClick={handleAddClick} title="Add content" disabled={textareaDisabled}>
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
             <path d="M8 3v10M3 8h10" />
           </svg>
@@ -621,7 +645,7 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
           const after = inputValue.slice(pos);
           setInputValue(before + mention + after);
           requestAnimationFrame(() => textareaRef.current?.focus());
-        }} title="Reference browser (@browser)" disabled={disabled}>
+        }} title="Reference browser (@browser)" disabled={textareaDisabled}>
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
             <circle cx="8" cy="8" r="6.5"/>
             <path d="M8 1.5C6 4 5 6 5 8s1 4 3 6.5M8 1.5C10 4 11 6 11 8s-1 4-3 6.5M1.5 8h13"/>
@@ -634,7 +658,7 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
         {/* Right: effort selector + active file indicator */}
         <EffortSelector
           currentEffort={effortLevel}
-          disabled={disabled}
+          disabled={textareaDisabled}
           onEffortChange={(level) => {
             onEffortChange(level);
             vscode.postMessage({ type: 'set_effort_level', level });
@@ -718,7 +742,7 @@ function ToolbarIconButton({
   return (
     <button
       onClick={onClick}
-      disabled={disabled}
+      disabled={textareaDisabled}
       title={title}
       aria-label={title}
       style={{

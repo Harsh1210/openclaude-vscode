@@ -111,6 +111,19 @@ export interface GetSessionsMessage {
   type: 'get_sessions';
 }
 
+/** User wants to delete a session */
+export interface DeleteSessionMessage {
+  type: 'delete_session';
+  sessionId: string;
+}
+
+/** Webview notifies extension of a session title update (from ai-title) */
+export interface UpdateSessionTitleMessage {
+  type: 'update_session_title';
+  sessionId: string;
+  title: string;
+}
+
 /** Webview requests state restore after re-show */
 export interface RestoreStateMessage {
   type: 'restore_state';
@@ -136,6 +149,103 @@ export interface RewindMessage {
   dryRun?: boolean;
 }
 
+/** User types @ in input — request file search results */
+export interface AtMentionQueryMessage {
+  type: 'at_mention_query';
+  query: string;
+}
+
+/** User clicks paperclip — request file picker dialog */
+export interface FilePickerRequestMessage {
+  type: 'file_picker_request';
+  accept?: string[];
+}
+
+/** User clicks + button — add text/URL content */
+export interface AddContentMessage {
+  type: 'add_content';
+  contentType: 'text' | 'url';
+  content: string;
+}
+
+/** User drops files onto input area */
+export interface FileDropMessage {
+  type: 'file_drop';
+  files: Array<{ name: string; path: string; type: string }>;
+}
+
+/** Webview → Host: request rewind to a checkpoint (Story 10) */
+export interface RewindRequestMessage {
+  type: 'rewind';
+  messageUuid: string;
+  dryRun: boolean;
+}
+
+/** Webview → Host: request fork from a checkpoint (Story 10) */
+export interface ForkRequestMessage {
+  type: 'fork_session';
+  messageUuid: string;
+}
+
+/** Webview → Host: request fork + rewind from a checkpoint (Story 10) */
+export interface ForkAndRewindRequestMessage {
+  type: 'fork_and_rewind';
+  messageUuid: string;
+}
+
+/** Webview → Host: request current provider state (Story 11) */
+export interface GetProviderStateMessage {
+  type: 'get_provider_state';
+}
+
+/** Webview → Host: set provider configuration (Story 11) */
+export interface SetProviderMessage {
+  type: 'set_provider';
+  providerId: string;
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+}
+
+// MCP manager messages
+export interface McpRefreshStatusMessage { type: 'mcp_refresh_status'; }
+export interface McpReconnectMessage { type: 'mcp_reconnect'; serverName: string; }
+export interface McpToggleMessage { type: 'mcp_toggle'; serverName: string; enabled: boolean; }
+export interface McpAddServerMessage { type: 'mcp_add_server'; name: string; config: Record<string, unknown>; }
+export interface McpRemoveServerMessage { type: 'mcp_remove_server'; serverName: string; }
+
+// Plugin manager messages
+export interface PluginRefreshMessage { type: 'plugin_refresh'; }
+export interface PluginToggleMessage { type: 'plugin_toggle'; name: string; enabled: boolean; }
+export interface PluginInstallMessage { type: 'plugin_install'; name: string; scope: 'user' | 'project' | 'local'; }
+export interface PluginUninstallMessage { type: 'plugin_uninstall'; name: string; }
+export interface PluginBrowseMarketplaceMessage { type: 'plugin_browse_marketplace'; }
+export interface PluginAddSourceMessage { type: 'plugin_add_source'; url?: string; }
+
+// Onboarding
+export interface HideOnboardingMessage { type: 'hide_onboarding'; }
+export interface OpenWalkthroughMessage { type: 'open_walkthrough'; }
+
+// Connection
+export interface RetryConnectionMessage { type: 'retry_connection'; }
+
+// Clipboard
+export interface CopyMessageMessage { type: 'copy_message'; content: string; }
+
+// Elicitation (alternate shape with `values` instead of `response`)
+export interface ElicitationResponseValuesMessage { type: 'elicitation_response'; requestId: string; values: Record<string, unknown>; }
+export interface ElicitationCancelMessage { type: 'elicitation_cancel'; requestId: string; }
+
+// Fast mode toggle
+export interface ToggleFastModeMessage { type: 'toggle_fast_mode'; enabled: boolean; }
+
+// Plan review
+export interface PlanReviewSubmitMessage { type: 'plan_review_submit'; requestId: string; action: Record<string, unknown>; }
+
+// Teleport
+export interface TeleportAcceptMessage { type: 'teleport_accept'; remoteSessionId: string; }
+export interface TeleportRejectMessage { type: 'teleport_reject'; remoteSessionId: string; }
+
 /** All messages the webview can send to the extension host */
 export type WebviewToHostMessage =
   | ReadyMessage
@@ -143,21 +253,53 @@ export type WebviewToHostMessage =
   | InterruptMessage
   | PermissionResponseMessage
   | ElicitationResponseMessage
+  | ElicitationResponseValuesMessage
+  | ElicitationCancelMessage
   | NewConversationMessage
   | ResumeSessionMessage
   | SetModelMessage
   | SetPermissionModeMessage
   | GetContextUsageMessage
   | CopyToClipboardMessage
+  | CopyMessageMessage
   | OpenFileMessage
   | DiffResponseMessage
   | OpenPluginsMessage
   | LogoutMessage
   | GetSessionsMessage
+  | DeleteSessionMessage
+  | UpdateSessionTitleMessage
   | RestoreStateMessage
   | SlashCommandMessage
   | SetEffortLevelMessage
-  | RewindMessage;
+  | RewindMessage
+  | RewindRequestMessage
+  | ForkRequestMessage
+  | ForkAndRewindRequestMessage
+  | GetProviderStateMessage
+  | SetProviderMessage
+  | AtMentionQueryMessage
+  | FilePickerRequestMessage
+  | AddContentMessage
+  | FileDropMessage
+  | McpRefreshStatusMessage
+  | McpReconnectMessage
+  | McpToggleMessage
+  | McpAddServerMessage
+  | McpRemoveServerMessage
+  | PluginRefreshMessage
+  | PluginToggleMessage
+  | PluginInstallMessage
+  | PluginUninstallMessage
+  | PluginBrowseMarketplaceMessage
+  | PluginAddSourceMessage
+  | HideOnboardingMessage
+  | OpenWalkthroughMessage
+  | RetryConnectionMessage
+  | PlanReviewSubmitMessage
+  | TeleportAcceptMessage
+  | TeleportRejectMessage
+  | ToggleFastModeMessage;
 
 // ============================================================
 // Extension Host -> Webview messages
@@ -188,6 +330,12 @@ export interface PermissionRequestMessage {
   toolName: string;
   toolInput: Record<string, unknown>;
   riskLevel?: string;
+  title?: string;
+  description?: string;
+  decisionReason?: string;
+  blockedPath?: string;
+  permissionSuggestions?: unknown[];
+  agentId?: string;
 }
 
 /** Cancel a stale permission/elicitation dialog */
@@ -252,6 +400,107 @@ export interface FontConfigMessage {
   chatFontFamily: string;
 }
 
+/** @-mention search results from extension host */
+export interface AtMentionResultsMessage {
+  type: 'at_mention_results';
+  query: string;
+  results: AtMentionResult[];
+}
+
+export interface AtMentionResult {
+  type: 'file' | 'folder' | 'line_range' | 'terminal' | 'browser';
+  label: string;
+  detail: string;
+  insertText: string;
+  icon: string;
+}
+
+/** File picker result (user selected files) */
+export interface FilePickerResultMessage {
+  type: 'file_picker_result';
+  files: Attachment[];
+}
+
+/** Active file in editor changed */
+export interface ActiveFileChangedMessage {
+  type: 'active_file_changed';
+  filePath: string | null;
+  fileName: string | null;
+  languageId: string | null;
+}
+
+/** Slash commands available (sent after initialize) */
+export interface SlashCommandsAvailableMessage {
+  type: 'slash_commands_available';
+  commands: Array<{
+    name: string;
+    description: string;
+    argumentHint: string;
+  }>;
+}
+
+// ============================================================================
+// Checkpoint Messages (Story 10)
+// ============================================================================
+
+/** Host → Webview: checkpoint state update */
+export interface CheckpointStateMessage {
+  type: 'checkpoint_state';
+  checkpoints: Array<{
+    messageUuid: string;
+    sessionId: string;
+    fileCount: number;
+    filenames: string[];
+    canRewind: boolean;
+    lastSessionState?: string;
+  }>;
+}
+
+/** Host → Webview: rewind preview result (from dry_run) */
+export interface RewindPreviewMessage {
+  type: 'rewind_preview';
+  messageUuid: string;
+  canRewind: boolean;
+  error?: string;
+  filesChanged?: string[];
+  insertions?: number;
+  deletions?: number;
+}
+
+/** Host → Webview: rewind completed result */
+export interface RewindResultMessage {
+  type: 'rewind_result';
+  messageUuid: string;
+  success: boolean;
+  error?: string;
+  filesChanged?: string[];
+  insertions?: number;
+  deletions?: number;
+}
+
+// ============================================================================
+// Provider Messages (Story 11)
+// ============================================================================
+
+export interface ProviderDefinitionInfo {
+  id: string;
+  label: string;
+  requiresApiKey: boolean;
+  requiresBaseUrl: boolean;
+  supportsModel: boolean;
+  defaultBaseUrl?: string;
+}
+
+/** Host → Webview: current provider state */
+export interface ProviderStateMessage {
+  type: 'provider_state';
+  providers: ProviderDefinitionInfo[];
+  currentProviderId: string;
+  currentModel?: string;
+  currentBaseUrl?: string;
+  error?: string;
+}
+
 /** All messages the extension host can send to the webview */
 export type HostToWebviewMessage =
   | InitStateMessage
@@ -265,7 +514,15 @@ export type HostToWebviewMessage =
   | AtMentionInsertedMessage
   | SessionListMessage
   | ProcessStateMessage
-  | FontConfigMessage;
+  | FontConfigMessage
+  | CheckpointStateMessage
+  | RewindPreviewMessage
+  | RewindResultMessage
+  | ProviderStateMessage
+  | AtMentionResultsMessage
+  | FilePickerResultMessage
+  | ActiveFileChangedMessage
+  | SlashCommandsAvailableMessage;
 
 // ============================================================
 // Shared types

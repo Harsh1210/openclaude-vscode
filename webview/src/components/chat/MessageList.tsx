@@ -38,9 +38,11 @@ export function MessageList({ messages, isStreaming }: MessageListProps) {
         {/* Message list */}
         <div className="py-4">
           {messages.map((msg) => (
-            <div key={msg.id}>
+            <div key={msg.id} className="message-row">
               {msg.role === 'user' ? (
                 <UserMessage message={msg} />
+              ) : msg.role === 'system' ? (
+                <SystemMessage text={msg.text ?? ''} />
               ) : (
                 <AssistantMessage message={msg} />
               )}
@@ -91,6 +93,23 @@ function EmptyState() {
       <div className="text-3xl mb-3">{"{ }"}</div>
       <p className="text-sm font-medium mb-1">No messages yet</p>
       <p className="text-xs">Type a message below to start a conversation.</p>
+    </div>
+  );
+}
+
+/** Inline system message (api_retry, compact_boundary, tool_use_summary) */
+function SystemMessage({ text }: { text: string }) {
+  return (
+    <div
+      style={{
+        color: 'var(--app-secondary-foreground)',
+        fontSize: 11,
+        fontStyle: 'italic',
+        padding: '2px 0',
+        opacity: 0.7,
+      }}
+    >
+      {text}
     </div>
   );
 }

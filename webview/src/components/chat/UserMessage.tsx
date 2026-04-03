@@ -1,26 +1,31 @@
 import type { ChatMessage } from '../../types/chat';
+import { MessageActions } from './MessageActions';
 
 interface UserMessageProps {
   message: ChatMessage;
+  onEdit?: (uuid: string, newContent: string) => void;
 }
 
-export function UserMessage({ message }: UserMessageProps) {
+/**
+ * User message bubble — exact Claude Code styling:
+ * .userMessageContainer_07S1Yg: display:inline-block; position:relative; margin:4px 0
+ * .userMessage_07S1Yg: white-space:pre-wrap; border:1px solid var(--app-input-border);
+ *   border-radius:6px; background:var(--app-input-background); padding:4px 6px
+ */
+export function UserMessage({ message, onEdit }: UserMessageProps) {
   return (
-    <div className="flex justify-end px-4 py-2">
-      <div className="max-w-[85%]">
-        {/* User label */}
-        <div className="flex items-center justify-end gap-2 mb-1">
-          <span className="text-xs opacity-50">You</span>
+    <div style={{ textAlign: 'left', position: 'relative', width: '100%', padding: '0 16px' }}>
+      <div className="group" style={{ display: 'inline-block', position: 'relative', margin: '4px 0', width: '100%' }}>
+        <div className="user-message-bubble">
+          {message.text || ''}
         </div>
-
-        {/* Message bubble */}
-        <div
-          className="rounded-lg px-3 py-2 text-sm leading-relaxed
-            bg-vscode-button-bg text-vscode-button-fg"
-        >
-          <p className="whitespace-pre-wrap break-words m-0">
-            {message.text || ''}
-          </p>
+        <div className="flex justify-end mt-1">
+          <MessageActions
+            messageRole="user"
+            content={message.text || ''}
+            uuid={message.id}
+            onEdit={onEdit}
+          />
         </div>
       </div>
     </div>
