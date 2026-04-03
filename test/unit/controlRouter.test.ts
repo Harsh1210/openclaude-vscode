@@ -32,6 +32,7 @@ describe('ControlRouter', () => {
     expect(handler).toHaveBeenCalledWith(
       request.request,
       expect.any(AbortSignal),
+      'req-001',
     );
 
     // Should have written a success response
