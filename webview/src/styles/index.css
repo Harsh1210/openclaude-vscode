@@ -1,3 +1,6 @@
+/* Import highlight.js theme that matches VS Code dark/light */
+@import 'highlight.js/styles/vs2015.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -9,4 +12,34 @@ body {
   color: var(--vscode-editor-foreground);
   font-family: var(--vscode-font-family);
   font-size: var(--vscode-font-size);
+}
+
+/* Markdown prose overrides for VS Code webview */
+.markdown-body p {
+  margin: 0.5em 0;
+  line-height: 1.6;
+}
+
+.markdown-body h1, .markdown-body h2, .markdown-body h3,
+.markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+  font-weight: 600;
+}
+
+.markdown-body ul, .markdown-body ol {
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+}
+
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--vscode-panel-border);
+  margin: 1em 0;
+}
+
+/* highlight.js overrides to match VS Code */
+.hljs {
+  background: transparent !important;
+  padding: 0 !important;
 }

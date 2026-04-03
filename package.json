@@ -499,15 +499,16 @@
 		"test": "vitest run",
 		"test:watch": "vitest"
 	},
-	"dependencies": {},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
 		"@types/vscode": "^1.94.0",
+		"@typescript-eslint/eslint-plugin": "^8.58.0",
+		"@typescript-eslint/parser": "^8.58.0",
+		"@vscode/vsce": "^3.0.0",
 		"esbuild": "^0.21.0",
 		"eslint": "^8.57.0",
 		"prettier": "^3.3.0",
 		"typescript": "^5.5.0",
-		"@vscode/vsce": "^3.0.0",
 		"vitest": "^1.6.0"
 	}
 }

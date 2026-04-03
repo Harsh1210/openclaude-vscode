@@ -36,7 +36,7 @@ export function useTheme(): ThemeKind {
 
   useEffect(() => {
     const unsubscribe = vscode.onMessage('theme_changed', (message) => {
-      const newTheme = (message as { theme: ThemeKind }).theme;
+      const newTheme = (message as unknown as { theme: ThemeKind }).theme;
       if (newTheme) {
         setTheme(newTheme);
       }
