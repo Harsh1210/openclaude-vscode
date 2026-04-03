@@ -34,7 +34,7 @@ export function ProviderBadge() {
   // Listen for provider_state messages from extension host
   useEffect(() => {
     return vscode.onMessage('provider_state', (msg) => {
-      const data = msg as {
+      const data = msg as unknown as {
         providers?: Array<{ id: string; label: string; requiresApiKey?: boolean; requiresBaseUrl?: boolean; supportsModel?: boolean; defaultBaseUrl?: string }>;
         currentProviderId: string;
         currentModel?: string;

@@ -742,7 +742,7 @@ function ToolbarIconButton({
   return (
     <button
       onClick={onClick}
-      disabled={textareaDisabled}
+      disabled={disabled}
       title={title}
       aria-label={title}
       style={{
