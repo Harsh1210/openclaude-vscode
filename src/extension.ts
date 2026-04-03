@@ -4,6 +4,7 @@ import { OpenClaudeWebviewProvider, OpenClaudePanelSerializer } from './webview/
 import { ProcessManager, ProcessState } from './process/processManager';
 import { createDiffContentProviders } from './diff/diffContentProvider';
 import { DiffManager } from './diff/diffManager';
+import { createCanUseToolHandler } from './diff/diffHandler';
 
 let webviewManager: WebviewManager | undefined;
 let diffManagerInstance: DiffManager | undefined;
@@ -327,6 +328,16 @@ export function activate(context: vscode.ExtensionContext) {
       permissionMode,
       env,
     });
+
+    // Register diff handler for can_use_tool requests (file edit/write tools)
+    processManager.registerControlHandler(
+      'can_use_tool',
+      createCanUseToolHandler(
+        diffManager,
+        () => processManager?.ndjsonTransport,
+        output,
+      ),
+    );
 
     processManager.onMessage((msg) => {
       output.info(`[OpenClaude] Message: ${JSON.stringify(msg).substring(0, 200)}`);

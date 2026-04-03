@@ -8,11 +8,20 @@ import type {
   SDKControlRequest,
 } from '../types/messages';
 
-/** Handler function signature — receives the request inner and an abort signal */
+/** Handler function signature — receives the request inner, abort signal, and request ID */
 export type ControlRequestHandler = (
   request: ControlRequestInner,
   signal: AbortSignal,
+  requestId: string,
 ) => Promise<unknown>;
+
+/**
+ * Sentinel value: when a handler returns this, the ControlRouter skips
+ * sending an automatic response. The handler is responsible for sending
+ * its own response via the transport (e.g., DiffManager sends responses
+ * asynchronously when the user clicks accept/reject).
+ */
+export const SELF_HANDLED = Symbol('self-handled');
 
 /** Function to write a message to the CLI's stdin */
 export type WriteFn = (message: unknown) => void;
@@ -62,8 +71,11 @@ export class ControlRouter {
     this.activeRequests.set(request_id, abortController);
 
     try {
-      const result = await handler(request.request, abortController.signal);
-      this.sendSuccessResponse(request_id, result as Record<string, unknown>);
+      const result = await handler(request.request, abortController.signal, request_id);
+      // If the handler returned SELF_HANDLED, it manages its own response
+      if (result !== SELF_HANDLED) {
+        this.sendSuccessResponse(request_id, result as Record<string, unknown>);
+      }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : String(err);

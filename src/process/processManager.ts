@@ -110,6 +110,11 @@ export class ProcessManager {
     return this._initializeResponse;
   }
 
+  /** Get the current NDJSON transport (available after spawn). */
+  get ndjsonTransport(): NdjsonTransport | undefined {
+    return this.transport;
+  }
+
   /**
    * Spawn the CLI process and perform the initialize handshake.
    * Returns the InitializeResponse on success.
