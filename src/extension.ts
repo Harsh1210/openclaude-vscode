@@ -447,6 +447,12 @@ export function activate(context: vscode.ExtensionContext) {
   webviewManager.onMessage('send_prompt', async (message) => {
     output.info(`[Webview→CLI] send_prompt: ${message.text.substring(0, 100)}`);
 
+    // OpenClaude-specific: /provider opens the provider picker dialog
+    if (message.text.trim() === '/provider') {
+      webviewManager!.broadcast({ type: 'open_provider_picker' } as never);
+      return;
+    }
+
     const pm = await ensureProcess();
     if (!pm) return;
 
@@ -464,6 +470,13 @@ export function activate(context: vscode.ExtensionContext) {
   webviewManager.onMessage('slash_command', async (message) => {
     const msg = message as unknown as { command: string; args?: string };
     output.info(`[Webview→CLI] slash_command: /${msg.command}`);
+
+    // OpenClaude-specific: /provider opens the provider picker dialog
+    if (msg.command === 'provider') {
+      webviewManager!.broadcast({ type: 'open_provider_picker' } as never);
+      return;
+    }
+
     const pm = await ensureProcess();
     if (!pm) return;
     const content = msg.args ? `/${msg.command} ${msg.args}` : `/${msg.command}`;
@@ -524,7 +537,10 @@ export function activate(context: vscode.ExtensionContext) {
       processManager.dispose();
       processManager = undefined;
     }
+    currentSessionId = undefined;
+    crashRestartCount = 0;
     checkpointManager.clear();
+    webviewManager!.broadcast({ type: 'clearMessages' } as never);
     webviewManager!.broadcast({ type: 'process_state', state: 'stopped' });
     webviewManager!.broadcast({ type: 'checkpoint_state', checkpoints: [] });
   });
@@ -995,7 +1011,10 @@ export function activate(context: vscode.ExtensionContext) {
         processManager.dispose();
         processManager = undefined;
       }
+      currentSessionId = undefined;
+      crashRestartCount = 0;
       checkpointManager.clear();
+      webviewManager!.broadcast({ type: 'clearMessages' } as never);
       webviewManager!.broadcast({ type: 'process_state', state: 'stopped' });
       webviewManager!.broadcast({ type: 'checkpoint_state', checkpoints: [] });
     }),

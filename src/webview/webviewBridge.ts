@@ -104,7 +104,7 @@ export class WebviewBridge implements vscode.Disposable {
 
     // Dispatch to registered handlers
     const handlers = this.handlers.get(message.type);
-    if (handlers) {
+    if (handlers && handlers.length > 0) {
       for (const handler of handlers) {
         try {
           handler(message as never, this.panelId);
@@ -112,6 +112,9 @@ export class WebviewBridge implements vscode.Disposable {
           console.error(`Error in webview message handler for '${message.type}':`, err);
         }
       }
+    } else if (message.type !== 'ready') {
+      // Log unhandled messages for debugging
+      console.warn(`[WebviewBridge] No handler for message type: '${message.type}' (registered: ${Array.from(this.handlers.keys()).join(', ')})`);
     }
   }
 

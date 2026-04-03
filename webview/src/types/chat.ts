@@ -17,7 +17,7 @@ export interface RenderableBlock {
 /** A single chat message in the UI */
 export interface ChatMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   /** For user messages: the text content */
   text?: string;
   /** For assistant messages: array of renderable content blocks */

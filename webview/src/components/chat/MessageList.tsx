@@ -22,7 +22,8 @@ export function MessageList({ messages, isStreaming }: MessageListProps) {
     return (
       <div
         ref={containerRef}
-        className="flex-1 flex items-center justify-center overflow-y-auto"
+        className="messages-container"
+        style={{ justifyContent: 'center', alignItems: 'center' }}
       >
         <EmptyState />
       </div>
@@ -33,14 +34,17 @@ export function MessageList({ messages, isStreaming }: MessageListProps) {
     <div className="flex-1 relative">
       <div
         ref={containerRef}
-        className="absolute inset-0 overflow-y-auto"
+        className="messages-container"
+        style={{ position: 'absolute', inset: 0 }}
       >
         {/* Message list */}
-        <div className="py-4">
+        <div>
           {messages.map((msg) => (
-            <div key={msg.id}>
+            <div key={msg.id} className="message">
               {msg.role === 'user' ? (
                 <UserMessage message={msg} />
+              ) : msg.role === 'system' ? (
+                <SystemMessage text={msg.text ?? ''} />
               ) : (
                 <AssistantMessage message={msg} />
               )}
@@ -87,10 +91,29 @@ function hasStreamingBlocks(messages: ChatMessage[]): boolean {
 
 function EmptyState() {
   return (
-    <div className="text-center opacity-40 px-8">
-      <div className="text-3xl mb-3">{"{ }"}</div>
-      <p className="text-sm font-medium mb-1">No messages yet</p>
-      <p className="text-xs">Type a message below to start a conversation.</p>
+    <div className="empty-state">
+      <div className="empty-state-content" style={{ opacity: 0.4, padding: '0 20px' }}>
+        <div style={{ fontSize: '2em', marginBottom: 12 }}>{"{ }"}</div>
+        <p style={{ fontSize: '0.85em', fontWeight: 500, marginBottom: 4 }}>No messages yet</p>
+        <p style={{ fontSize: '0.75em' }}>Type a message below to start a conversation.</p>
+      </div>
+    </div>
+  );
+}
+
+/** Inline system message (api_retry, compact_boundary, tool_use_summary) */
+function SystemMessage({ text }: { text: string }) {
+  return (
+    <div
+      style={{
+        color: 'var(--app-secondary-foreground)',
+        fontSize: 11,
+        fontStyle: 'italic',
+        padding: '2px 0',
+        opacity: 0.7,
+      }}
+    >
+      {text}
     </div>
   );
 }

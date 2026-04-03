@@ -89,6 +89,16 @@ export class EventEmitter<T> {
   }
 }
 
+export class ThemeColor {
+  constructor(public readonly id: string) {}
+}
+
+export class ThemeIcon {
+  static readonly File = new ThemeIcon('file');
+  static readonly Folder = new ThemeIcon('folder');
+  constructor(public readonly id: string) {}
+}
+
 export class Disposable {
   static from(...disposables: { dispose: () => void }[]): Disposable {
     return new Disposable(() => {
@@ -146,8 +156,17 @@ export class TabInputWebview {
   constructor(public readonly viewType: string) {}
 }
 
+const onDidCloseTerminalEmitter = new EventEmitter<unknown>();
+
 export const window = {
   activeColorTheme: { kind: ColorThemeKind.Dark },
+  onDidCloseTerminal: onDidCloseTerminalEmitter.event,
+  createTerminal: (_options?: unknown) => ({
+    name: 'mock-terminal',
+    sendText: (_text: string) => {},
+    show: () => {},
+    dispose: () => {},
+  }),
   createWebviewPanel: (_viewType: string, _title: string, _column: ViewColumn, _options: unknown) => {
     const webview = createMockWebview();
     return {
@@ -232,6 +251,8 @@ export default {
   Uri,
   EventEmitter,
   Disposable,
+  ThemeColor,
+  ThemeIcon,
   TabInputWebview,
   window,
   workspace,

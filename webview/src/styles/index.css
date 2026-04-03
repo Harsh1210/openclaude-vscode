@@ -5,19 +5,742 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  margin: 0;
-  padding: 0;
-  background-color: var(--vscode-editor-background);
-  color: var(--vscode-editor-foreground);
-  font-family: var(--vscode-font-family);
-  font-size: var(--vscode-font-size);
+/* ============================================================
+   Exact Claude Code design tokens
+   Source: ~/.vscode/extensions/anthropic.claude-code-2.1.90-darwin-arm64/webview/index.css
+   ============================================================ */
+
+html {
+  /* Brand — OpenClaude: white ring, neutral colors (avoids Claude's orange) */
+  --app-claude-orange: #ffffff;
+  --app-claude-clay-button-orange: #ffffff;
+  --app-claude-ivory: #1a1a1a;
+  --app-claude-slate: #141413;
+
+  /* Spacing */
+  --app-spacing-small: 4px;
+  --app-spacing-medium: 8px;
+  --app-spacing-large: 12px;
+  --app-spacing-xlarge: 16px;
+
+  /* Border radius */
+  --corner-radius-small: 4px;
+  --corner-radius-medium: 6px;
+  --corner-radius-large: 8px;
+
+  /* Typography */
+  --app-monospace-font-family: var(--vscode-editor-font-family, monospace);
+  --app-monospace-font-size: var(--vscode-editor-font-size, 12px);
+  --app-monospace-font-size-small: calc(var(--vscode-editor-font-size, 12px) - 2px);
+
+  /* Foreground / background */
+  --app-primary-foreground: var(--vscode-foreground);
+  --app-primary-background: var(--vscode-sideBar-background);
+  --app-primary-border-color: var(--vscode-sideBarActivityBarTop-border);
+  --app-secondary-foreground: var(--vscode-descriptionForeground);
+  --app-secondary-background: var(--vscode-editor-background);
+
+  /* Input */
+  --app-input-foreground: var(--vscode-input-foreground);
+  --app-input-background: var(--vscode-input-background);
+  --app-input-border: var(--vscode-inlineChatInput-border);
+  --app-input-active-border: var(--vscode-inputOption-activeBorder);
+  --app-input-placeholder-foreground: var(--vscode-input-placeholderForeground);
+  --app-input-secondary-foreground: var(--vscode-input-foreground);
+  --app-input-secondary-background: var(--vscode-menu-background);
+
+  /* Tool / code */
+  --app-tool-background: var(--vscode-editor-background);
+
+  /* List */
+  --app-list-padding: 0px;
+  --app-list-item-padding: 4px 8px;
+  --app-list-border-color: transparent;
+  --app-list-border-radius: 4px;
+  --app-list-hover-background: var(--vscode-list-hoverBackground);
+  --app-list-active-background: var(--vscode-list-activeSelectionBackground);
+  --app-list-active-foreground: var(--vscode-list-activeSelectionForeground);
+  --app-list-gap: 2px;
+
+  /* Menu */
+  --app-menu-background: var(--vscode-menu-background);
+  --app-menu-border: var(--vscode-menu-border);
+  --app-menu-foreground: var(--vscode-menu-foreground);
+  --app-menu-selection-background: var(--vscode-menu-selectionBackground);
+  --app-menu-selection-foreground: var(--vscode-menu-selectionForeground);
+
+  /* Status / alerts */
+  --app-warning-foreground: var(--vscode-menu-foreground);
+  --app-warning-background: var(--vscode-input-background);
+  --app-warning-accent: #e5a54b;
+  --app-error-foreground: var(--vscode-errorForeground);
+  --app-success-foreground: var(--vscode-gitDecoration-addedResourceForeground);
+  --app-disabled-foreground: var(--vscode-disabledForeground);
+  --app-status-busy: var(--vscode-charts-green, #22c55e);
+  --app-status-pending: var(--vscode-charts-blue, #3b82f6);
+
+  /* Badges */
+  --app-badge-foreground: var(--vscode-badge-foreground);
+  --app-badge-background: var(--vscode-badge-background);
+
+  /* Header */
+  --app-header-background: var(--vscode-sideBar-background);
+
+  /* Splitter */
+  --app-splitter-background: var(--vscode-inlineChatInput-border);
+  --app-splitter-hover-background: var(--vscode-sash-hoverBorder);
+
+  /* Progress */
+  --app-progressbar-background: var(--vscode-progressBar-background);
+  --app-progressbar-border: var(--vscode-widget-border);
+
+  /* Widget */
+  --app-widget-border: var(--vscode-editorWidget-border);
+  --app-editor-highlight-background: var(--vscode-editor-lineHighlightBackground);
+
+  /* Buttons */
+  --app-ghost-button-hover-background: var(--vscode-toolbar-hoverBackground);
+  --app-button-foreground: var(--vscode-button-foreground);
+  --app-button-background: var(--vscode-button-background);
+  --app-button-hover-background: var(--vscode-button-hoverBackground);
+
+  /* Accent */
+  --app-accent-color: var(--vscode-inputOption-activeBorder);
+  --app-transparent-inner-border: #ffffff1a;
+
+  /* Spinner */
+  --app-spinner-foreground: var(--app-claude-orange);
+
+  /* Modal */
+  --app-modal-background: #000000bf;
+
+  /* Diff */
+  --app-diff-addition-foreground: var(--vscode-gitDecoration-addedResourceForeground);
+  --app-diff-deletion-foreground: var(--vscode-gitDecoration-deletedResourceForeground);
+
+  /* Mention chips */
+  --app-mention-chip-background: var(--vscode-chat-slashCommandBackground, var(--vscode-badge-background, #26477866));
+  --app-mention-chip-foreground: var(--vscode-chat-slashCommandForeground, var(--vscode-badge-foreground, #85b6ff));
+
+  /* Banner */
+  --app-banner-tint: #4a63af;
+
+  /* Root background (panel vs sidebar) */
+  --app-root-background: var(--app-primary-background);
 }
 
-/* Markdown prose overrides for VS Code webview */
+/* Light theme overrides */
+.vscode-light {
+  --app-transparent-inner-border: #00000012;
+  --app-spinner-foreground: var(--app-claude-clay-button-orange);
+  --app-root-background: var(--app-secondary-background);
+}
+
+/* ============================================================
+   Root layout — exact from Claude Code
+   ============================================================ */
+
+html {
+  display: flex;
+  overscroll-behavior: none;
+  position: relative;
+  flex: 1;
+  height: 100%;
+}
+
+body {
+  display: flex;
+  overscroll-behavior: none;
+  font-size: var(--vscode-chat-font-size, 13px);
+  font-family: var(--vscode-chat-font-family);
+  flex: 1;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--app-root-background);
+  color: var(--app-primary-foreground);
+}
+
+#root {
+  display: flex;
+  flex: 1;
+  max-width: 100%;
+}
+
+/* ============================================================
+   Scrollbars — thin VS Code themed (6px)
+   ============================================================ */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background, rgba(128,128,128,0.4));
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground, rgba(128,128,128,0.7));
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--vscode-scrollbarSlider-background, rgba(128,128,128,0.4)) transparent;
+}
+
+/* ============================================================
+   Form elements
+   ============================================================ */
+
+button {
+  color: var(--app-primary-foreground);
+  font-family: var(--vscode-chat-font-family);
+  font-size: var(--vscode-chat-font-size, 13px);
+}
+
+textarea:focus {
+  outline-width: 1px;
+  outline-style: solid;
+  outline-offset: -1px;
+  outline-color: var(--vscode-focusBorder);
+  opacity: 1;
+}
+
+textarea.input {
+  display: block;
+  scrollbar-width: none;
+  outline: none;
+}
+
+/* ============================================================
+   Input container — exact from Claude Code .inputContainer_cKsPxg
+   ============================================================ */
+
+.input-container {
+  background: var(--app-input-secondary-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-large);
+  color: var(--app-input-foreground);
+  display: flex;
+  position: relative;
+  flex-direction: column;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  box-shadow: 0 1px 2px #0000001a;
+}
+
+.input-wrapper {
+  width: 100%;
+  max-width: 680px;
+  margin: 0 auto;
+}
+
+/* Focus ring — orange by default, changes per permission mode */
+.input-container:focus-within {
+  --focus-ring-color: var(--app-claude-orange);
+  border-color: var(--focus-ring-color);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--focus-ring-color) 12%, transparent),
+    0 1px 2px color-mix(in srgb, var(--focus-ring-color), transparent 80%);
+}
+
+.input-container[data-permission-mode="acceptEdits"]:focus-within {
+  --focus-ring-color: var(--app-primary-foreground);
+}
+
+.input-container[data-permission-mode="plan"]:focus-within {
+  --focus-ring-color: var(--vscode-focusBorder, var(--app-button-background));
+}
+
+.input-container[data-permission-mode="bypassPermissions"]:focus-within,
+.input-container[data-permission-mode="auto"]:focus-within {
+  --focus-ring-color: var(--app-error-foreground);
+}
+
+/* ============================================================
+   User message bubble — exact from Claude Code .userMessage_07S1Yg
+   ============================================================ */
+
+.user-message-bubble {
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-medium); /* 6px */
+  background-color: var(--app-input-background);
+  display: inline-block;
+  overflow-x: hidden;
+  overflow-y: hidden;
+  user-select: text;
+  max-width: 100%;
+  padding: 4px 6px;
+}
+
+/* ============================================================
+   Message list — exact from Claude Code .message_07S1Yg
+   ============================================================ */
+
+.message-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  padding: 8px 0;
+}
+
+.message-row:first-child {
+  padding-top: 0;
+}
+
+/* ============================================================
+   Thinking block — exact from Claude Code .thinking_aHyQPQ
+   ============================================================ */
+
+.thinking-block {
+  width: fit-content;
+  margin-top: 4px;
+  margin-bottom: 12px;
+}
+
+.thinking-summary {
+  cursor: pointer;
+  color: var(--app-secondary-foreground);
+  opacity: 0.8;
+  user-select: none;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-style: normal;
+}
+
+.thinking-summary::-webkit-details-marker {
+  display: none;
+}
+
+details[open] .thinking-summary,
+.thinking-summary:hover {
+  opacity: 1;
+}
+
+.thinking-toggle {
+  width: 16px;
+  height: 16px;
+  margin-left: 0;
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+
+details[open] .thinking-toggle {
+  transform: rotate(90deg);
+}
+
+.thinking-content {
+  color: var(--app-secondary-foreground);
+  margin-top: 4px;
+  font-weight: 400;
+}
+
+/* ============================================================
+   Code block — exact from Claude Code .codeBlockWrapper_-a7MRw
+   ============================================================ */
+
+.code-block-wrapper {
+  position: relative;
+  margin: 8px 0;
+}
+
+.code-block-wrapper pre {
+  overflow-x: auto;
+  white-space: pre;
+  box-sizing: border-box;
+  border-radius: 4px; /* corner-radius-small */
+  max-width: 100%;
+  margin: 0;
+  padding: 8px;
+  font-family: var(--app-monospace-font-family);
+  font-size: var(--app-monospace-font-size);
+}
+
+/* ============================================================
+   Mention chip — exact from Claude Code .mentionChip_uq5aLg
+   ============================================================ */
+
+.mention-chip {
+  display: inline;
+  background-color: var(--app-mention-chip-background);
+  color: var(--app-mention-chip-foreground);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.mention-chip[role="button"] {
+  cursor: pointer;
+}
+
+.mention-chip[role="button"]:hover {
+  filter: brightness(1.15);
+}
+
+/* ============================================================
+   Tool result — exact from Claude Code .toolResult_uq5aLg
+   ============================================================ */
+
+.tool-result {
+  background-color: var(--app-tool-background);
+  white-space: pre;
+  overflow-x: auto;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* ============================================================
+   Animations — exact from Claude Code
+   ============================================================ */
+
+@keyframes fadeIn {
+  0% { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.7; }
+  to { opacity: 1; }
+}
+
+@keyframes selectionConfirm {
+  0% { background-color: var(--app-input-secondary-background); }
+  50% { background-color: var(--app-button-background); opacity: 0.3; }
+  to { background-color: var(--app-input-secondary-background); }
+}
+
+/* Streaming dots */
+@keyframes streamingDot {
+  0%, 80%, 100% { opacity: 0; }
+  40% { opacity: 1; }
+}
+
+/* Error banner slide-down */
+@keyframes slideDown {
+  0% { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Spinner rotation */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Reduced motion overrides */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================================
+   Messages container — exact from Claude Code .messagesContainer_07S1Yg
+   ============================================================ */
+
+.messages-container {
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  background-color: var(--app-primary-background);
+  position: relative;
+  flex-direction: column;
+  flex: 1;
+  gap: 0;
+  min-width: 0;
+  padding: 20px 20px 40px;
+}
+
+.messages-container:focus {
+  outline: none;
+}
+
+/* ============================================================
+   Message — exact from Claude Code .message_07S1Yg
+   ============================================================ */
+
+.message {
+  color: var(--app-primary-foreground);
+  display: flex;
+  position: relative;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+  padding: 8px 0;
+}
+
+.message:first-child {
+  padding-top: 0;
+}
+
+/* ============================================================
+   Empty state — exact from Claude Code .emptyState_07S1Yg
+   ============================================================ */
+
+.empty-state {
+  display: flex;
+  animation: fadeIn .3s ease-in-out;
+  user-select: none;
+  flex-direction: column;
+  flex: 1;
+  justify-content: center;
+  align-items: center;
+}
+
+.empty-state-content {
+  text-align: center;
+  position: relative;
+  max-width: 480px;
+  top: -30px;
+}
+
+/* ============================================================
+   Error banner — exact from Claude Code .errorBanner_07S1Yg
+   ============================================================ */
+
+.error-banner {
+  background-color: color-mix(in srgb, var(--app-primary-background) 96%, var(--app-error-foreground) 4%);
+  color: var(--app-error-foreground);
+  border-bottom: 1px solid var(--app-error-foreground);
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  font-size: 13px;
+}
+
+.error-banner a {
+  color: inherit;
+}
+
+.error-message {
+  word-wrap: break-word;
+  user-select: text;
+  flex: 1;
+  margin-top: 2px;
+  padding: 10px 12px;
+}
+
+.error-dismiss {
+  color: var(--app-error-foreground);
+  cursor: pointer;
+  display: flex;
+  background: 0 0;
+  border: none;
+  justify-content: center;
+  align-items: center;
+  width: 44px;
+  height: 44px;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.error-dismiss:hover {
+  opacity: .7;
+}
+
+/* ============================================================
+   Spinner row — exact from Claude Code .spinnerRow_07S1Yg
+   ============================================================ */
+
+.spinner-row {
+  display: flex;
+  animation: fadeIn .3s ease-in-out;
+  align-items: center;
+  height: 1.85em;
+  margin-top: 4px;
+  margin-left: 0;
+}
+
+/* ============================================================
+   Input footer — exact from Claude Code .inputFooter_gGYT1w
+   ============================================================ */
+
+.input-footer {
+  display: flex;
+  color: var(--app-secondary-foreground);
+  border-top: .5px solid var(--app-input-border);
+  z-index: 6;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px;
+}
+
+/* ============================================================
+   Footer button — exact from Claude Code .footerButton_gGYT1w
+   ============================================================ */
+
+.footer-button {
+  position: relative;
+  appearance: none;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  display: inline-flex;
+  background: 0 0;
+  border: none;
+  border-radius: 2px;
+  flex-shrink: 1;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 2px 4px;
+  font-family: inherit;
+  font-size: .85em;
+}
+
+.footer-button span {
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+  display: inline-block;
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 200px;
+}
+
+.footer-button:hover {
+  background-color: var(--app-ghost-button-hover-background);
+}
+
+.footer-button:active:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.footer-button svg {
+  flex-shrink: 0;
+  height: 1em;
+}
+
+/* ============================================================
+   Send button — exact from Claude Code .sendButton_gGYT1w
+   ============================================================ */
+
+.sendButton, .menuButton {
+  cursor: pointer;
+  display: flex;
+  color: var(--app-secondary-foreground);
+  background-color: transparent;
+  border: none;
+  justify-content: center;
+  align-items: center;
+  width: 26px;
+  height: 26px;
+}
+
+.sendButton {
+  border-radius: 5px;
+}
+
+/* Default send button: orange */
+.sendButton {
+  color: var(--app-claude-ivory);
+  background-color: var(--app-claude-clay-button-orange);
+}
+
+/* Permission mode variants */
+.sendButton[data-permission-mode="acceptEdits"] {
+  color: var(--app-primary-background);
+  background-color: var(--app-primary-foreground);
+}
+
+.sendButton[data-permission-mode="plan"] {
+  color: var(--app-button-foreground);
+  background-color: var(--vscode-focusBorder, var(--app-button-background));
+}
+
+.sendButton[data-permission-mode="bypassPermissions"],
+.sendButton[data-permission-mode="auto"] {
+  color: var(--app-button-foreground);
+  background-color: var(--app-error-foreground);
+}
+
+.sendButton:disabled, .menuButton:disabled {
+  cursor: not-allowed;
+  opacity: .4;
+}
+
+.sendButton:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.sendButton:active:not(:disabled) {
+  filter: brightness(.9);
+}
+
+/* Send icon */
+.sendIcon {
+  color: var(--app-claude-ivory);
+  display: block;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  transform: none;
+}
+
+.sendButton[data-permission-mode="acceptEdits"] .sendIcon {
+  color: var(--app-tool-background);
+}
+
+.sendButton[data-permission-mode="plan"] .sendIcon,
+.sendButton[data-permission-mode="bypassPermissions"] .sendIcon,
+.sendButton[data-permission-mode="auto"] .sendIcon {
+  color: var(--app-button-foreground);
+}
+
+/* Stop icon */
+.stopIcon {
+  color: var(--app-claude-ivory);
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+.sendButton[data-permission-mode="acceptEdits"] .stopIcon {
+  color: var(--app-tool-background);
+}
+
+.sendButton[data-permission-mode="plan"] .stopIcon,
+.sendButton[data-permission-mode="bypassPermissions"] .stopIcon,
+.sendButton[data-permission-mode="auto"] .stopIcon {
+  color: var(--app-button-foreground);
+}
+
+/* ============================================================
+   Divider — exact from Claude Code .divider_gGYT1w
+   ============================================================ */
+
+.input-divider {
+  background: var(--app-input-border);
+  flex-shrink: 0;
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+}
+
+/* ============================================================
+   Markdown prose overrides
+   ============================================================ */
+
 .markdown-body p {
-  margin: 0.5em 0;
-  line-height: 1.6;
+  white-space: pre-wrap;
+  margin-top: 0.1em;
+  margin-bottom: 0.2em;
 }
 
 .markdown-body h1, .markdown-body h2, .markdown-body h3,
@@ -34,11 +757,11 @@ body {
 
 .markdown-body hr {
   border: none;
-  border-top: 1px solid var(--vscode-panel-border);
+  border-top: 1px solid var(--app-primary-border-color);
   margin: 1em 0;
 }
 
-/* highlight.js overrides to match VS Code */
+/* highlight.js overrides */
 .hljs {
   background: transparent !important;
   padding: 0 !important;

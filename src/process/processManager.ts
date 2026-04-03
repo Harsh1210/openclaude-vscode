@@ -43,6 +43,10 @@ export interface ProcessManagerOptions {
   sessionId?: string;
   /** Continue last session */
   continueSession?: boolean;
+  /** Fork session from a checkpoint UUID (used with sessionId) */
+  forkSession?: boolean;
+  /** Worktree name to pass as --worktree flag */
+  worktree?: string;
   /** Additional environment variables */
   env?: Record<string, string>;
   /** Initialize request options */
@@ -52,6 +56,13 @@ export interface ProcessManagerOptions {
   autoRestart?: boolean;
   /** Keep-alive interval in ms (default: 30000) */
   keepAliveIntervalMs?: number;
+  /** IDE MCP server metadata to pass in initialize handshake */
+  sdkMcpServers?: Array<{
+    name: string;
+    type: string;
+    url: string;
+    headers?: Record<string, string>;
+  }>;
 }
 
 type MessageCallback = (message: StdoutMessage) => void;
@@ -329,8 +340,17 @@ export class ProcessManager {
       args.push('--resume', this.options.sessionId);
     }
 
+    // Fork session: spawn from a checkpoint message UUID
+    if (this.options.forkSession) {
+      args.push('--fork-session');
+    }
+
     if (this.options.continueSession) {
       args.push('--continue');
+    }
+
+    if (this.options.worktree) {
+      args.push('--worktree', this.options.worktree);
     }
 
     return args;
@@ -368,7 +388,7 @@ export class ProcessManager {
         request: {
           subtype: 'initialize',
           hooks: {},
-          sdkMcpServers: [],
+          sdkMcpServers: this.options.sdkMcpServers ?? [],
           promptSuggestions: this.options.promptSuggestions ?? true,
           agentProgressSummaries: this.options.agentProgressSummaries ?? true,
         },

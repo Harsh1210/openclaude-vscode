@@ -1,31 +1,35 @@
 // src/diff/diffHandler.ts
 // Factory function that creates a ControlRequestHandler for can_use_tool
 // requests, delegating file edit/write tools to DiffManager and
-// auto-allowing all other tools.
+// non-file-edit tools to PermissionHandler.
 
 import type { OutputChannel } from 'vscode';
 import type { ControlRequestHandler } from '../process/controlRouter';
 import { SELF_HANDLED } from '../process/controlRouter';
 import type { DiffManager } from './diffManager';
 import type { NdjsonTransport } from '../process/ndjsonTransport';
+import type { PermissionHandler } from '../permissions/permissionHandler';
 import type { ControlRequestPermission } from '../types/messages';
 
 /**
- * Create a can_use_tool handler that routes file edit tools to DiffManager.
+ * Create a can_use_tool handler that routes file edit tools to DiffManager
+ * and non-file-edit tools to PermissionHandler.
  *
  * Returns SELF_HANDLED so the ControlRouter doesn't send an automatic response —
- * DiffManager sends responses asynchronously when the user clicks accept/reject.
+ * both DiffManager and PermissionHandler send responses asynchronously.
  *
  * @param diffManager The DiffManager instance for showing diffs
  * @param getTransport Function that returns the current NdjsonTransport
  * @param outputChannel Output channel for logging
+ * @param permissionHandler Optional PermissionHandler for non-file-edit tools
  */
 export function createCanUseToolHandler(
   diffManager: DiffManager,
   getTransport: () => NdjsonTransport | undefined,
   outputChannel: OutputChannel,
+  permissionHandler?: PermissionHandler,
 ): ControlRequestHandler {
-  return async (request, _signal, requestId) => {
+  return async (request, signal, requestId) => {
     const permRequest = request as ControlRequestPermission;
     const transport = getTransport();
 
@@ -43,9 +47,14 @@ export function createCanUseToolHandler(
       return SELF_HANDLED;
     }
 
-    // Other tools -> auto-allow for now (Story 7 will add a permission dialog)
+    // Non-file-edit tools -> PermissionHandler (if available)
+    if (permissionHandler) {
+      return permissionHandler.handleToolRequest(permRequest, signal, requestId);
+    }
+
+    // Fallback: auto-allow if no PermissionHandler
     outputChannel.appendLine(
-      `[DiffHandler] Auto-allowing non-file-edit tool: ${permRequest.tool_name}`,
+      `[DiffHandler] Auto-allowing non-file-edit tool (no PermissionHandler): ${permRequest.tool_name}`,
     );
     return {
       behavior: 'allow',

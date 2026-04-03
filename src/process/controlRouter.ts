@@ -132,3 +132,58 @@ export class ControlRouter {
     this.handlers.clear();
   }
 }
+
+/**
+ * Standalone helper that routes a raw CLI message to the webview or sends a control response.
+ * Used for elicitation, teleport, and cancel routing.
+ */
+export interface RouteControlHandlers {
+  postMessage: (msg: Record<string, unknown>) => void;
+  sendControlResponse?: (requestId: string, response: Record<string, unknown>) => void;
+}
+
+export function routeControlRequest(
+  message: Record<string, unknown>,
+  handlers: RouteControlHandlers,
+): void {
+  // Elicitation control_request → show dialog in webview
+  if (
+    message.type === 'control_request' &&
+    (message.request as Record<string, unknown> | undefined)?.subtype === 'elicitation'
+  ) {
+    const req = message.request as Record<string, unknown>;
+    handlers.postMessage({
+      type: 'show_elicitation',
+      requestId: message.request_id,
+      message: req.message,
+      fields: (req.fields as unknown[]) ?? [],
+    });
+    return;
+  }
+
+  // Teleport system message → show teleport dialog
+  if (message.type === 'system' && message.subtype === 'teleported-from') {
+    handlers.postMessage({
+      type: 'show_teleport',
+      remoteSessionId: message.remoteSessionId,
+      branch: message.branch ?? 'unknown',
+      messageCount: message.messageCount ?? 0,
+      sourceDevice: message.sourceDevice ?? 'unknown',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  // Control cancel → dismiss stale dialogs
+  if (message.type === 'control_cancel_request') {
+    handlers.postMessage({
+      type: 'dismiss_elicitation',
+      requestId: message.request_id,
+    });
+    handlers.postMessage({
+      type: 'dismiss_permission',
+      requestId: message.request_id,
+    });
+    return;
+  }
+}

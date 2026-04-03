@@ -1,5 +1,4 @@
 interface StreamingIndicatorProps {
-  /** Whether to show the indicator */
   visible: boolean;
 }
 
@@ -7,22 +6,16 @@ export function StreamingIndicator({ visible }: StreamingIndicatorProps) {
   if (!visible) return null;
 
   return (
-    <div className="flex items-center gap-1.5 px-4 py-2" role="status" aria-label="Generating response">
-      <div className="flex gap-1">
-        <Dot delay="0ms" />
-        <Dot delay="150ms" />
-        <Dot delay="300ms" />
-      </div>
-      <span className="text-xs opacity-50 ml-1">Generating...</span>
+    <div style={{ padding: '8px 0', display: 'flex', alignItems: 'center', gap: 4 }}>
+      {[0, 1, 2].map((i) => (
+        <span key={i} style={{
+          display: 'inline-block',
+          width: 6, height: 6,
+          borderRadius: '50%',
+          backgroundColor: 'var(--app-secondary-foreground)',
+          animation: `streamingDot 1.4s ease-in-out ${i * 0.16}s infinite`,
+        }} />
+      ))}
     </div>
-  );
-}
-
-function Dot({ delay }: { delay: string }) {
-  return (
-    <span
-      className="inline-block w-1.5 h-1.5 rounded-full bg-vscode-fg opacity-40 animate-bounce"
-      style={{ animationDelay: delay, animationDuration: '1s' }}
-    />
   );
 }

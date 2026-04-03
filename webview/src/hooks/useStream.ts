@@ -1,13 +1,26 @@
 import { useCallback, useRef } from 'react';
 import type {
   StreamEvent,
-  ContentBlock,
+  ContentBlock as MessageContentBlock,
   ContentDelta,
-  TextBlock,
-  ToolUseBlock,
-  ThinkingBlock,
+  TextBlock as MessageTextBlock,
+  ToolUseBlock as MessageToolUseBlock,
+  ThinkingBlock as MessageThinkingBlock,
 } from '../types/messages';
 import type { RenderableBlock, StreamState } from '../types/chat';
+import type {
+  ContentBlock,
+  ThinkingBlock,
+  RedactedThinkingBlock,
+  ImageBlock,
+  DocumentBlock,
+  SearchResultBlock,
+  WebSearchResultBlock,
+  ServerToolUseBlock,
+  TextBlock,
+  ToolUseBlock,
+  ToolResultBlock,
+} from '../types/blocks';
 
 interface UseStreamReturn {
   /** Process a single stream_event and return updated blocks */
@@ -223,7 +236,7 @@ function makeUnknown(uuid: string, parentToolUseId: string | null): StreamUpdate
  * The SDK sometimes includes text in the start event — we ignore it
  * (it gets re-sent in content_block_delta, causing duplicates).
  */
-function normalizeStartBlock(block: ContentBlock): ContentBlock {
+function normalizeStartBlock(block: MessageContentBlock): MessageContentBlock {
   switch (block.type) {
     case 'text':
       return { type: 'text', text: '' };
@@ -238,11 +251,11 @@ function normalizeStartBlock(block: ContentBlock): ContentBlock {
 
 /** Apply a content_block_delta to an existing block */
 function applyDelta(
-  block: ContentBlock,
+  block: MessageContentBlock,
   delta: ContentDelta,
   state: StreamState,
   index: number,
-): ContentBlock {
+): MessageContentBlock {
   // TypeScript needs help here — delta is a union type
   const d = delta as unknown as Record<string, unknown>;
 
@@ -251,7 +264,7 @@ function applyDelta(
       if (block.type !== 'text') return block;
       return {
         ...block,
-        text: (block as TextBlock).text + (d.text as string),
+        text: (block as MessageTextBlock).text + (d.text as string),
       };
     }
 
@@ -259,7 +272,7 @@ function applyDelta(
       if (block.type !== 'thinking') return block;
       return {
         ...block,
-        thinking: (block as ThinkingBlock).thinking + (d.thinking as string),
+        thinking: (block as MessageThinkingBlock).thinking + (d.thinking as string),
       };
     }
 
@@ -275,4 +288,170 @@ function applyDelta(
     default:
       return block;
   }
+}
+
+/**
+ * Parse a content_block_start event into a typed ContentBlock view-model.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function parseContentBlock(event: {
+  type: 'content_block_start';
+  index: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  content_block: Record<string, any>;
+}): ContentBlock {
+  const { index, content_block: cb } = event;
+
+  switch (cb.type) {
+    case 'thinking':
+      return {
+        type: 'thinking',
+        index,
+        thinking: cb.thinking ?? '',
+        summary: cb.summary ?? null,
+        isStreaming: true,
+      } satisfies ThinkingBlock;
+
+    case 'redacted_thinking':
+      return {
+        type: 'redacted_thinking',
+        index,
+        data: cb.data ?? '',
+        isStreaming: false,
+      } satisfies RedactedThinkingBlock;
+
+    case 'image':
+      return {
+        type: 'image',
+        index,
+        source: cb.source,
+        isStreaming: false,
+      } satisfies ImageBlock;
+
+    case 'document':
+      return {
+        type: 'document',
+        index,
+        source: cb.source,
+        title: cb.title ?? null,
+        context: cb.context ?? null,
+        citations: cb.citations ?? [],
+        isStreaming: false,
+      } satisfies DocumentBlock;
+
+    case 'search_result':
+      return {
+        type: 'search_result',
+        index,
+        source: cb.source ?? '',
+        title: cb.title ?? '',
+        content: cb.content ?? '',
+        url: cb.url ?? null,
+        isStreaming: false,
+      } satisfies SearchResultBlock;
+
+    case 'web_search_tool_result':
+      return {
+        type: 'web_search_tool_result',
+        index,
+        query: cb.query ?? '',
+        results: cb.results ?? [],
+        isStreaming: false,
+      } satisfies WebSearchResultBlock;
+
+    case 'server_tool_use':
+      return {
+        type: 'server_tool_use',
+        index,
+        id: cb.id,
+        name: cb.name,
+        input: cb.input ?? {},
+        isStreaming: true,
+      } satisfies ServerToolUseBlock;
+
+    case 'tool_use':
+      return {
+        type: 'tool_use',
+        index,
+        id: cb.id,
+        name: cb.name,
+        input: cb.input ?? {},
+        isStreaming: true,
+      } satisfies ToolUseBlock;
+
+    case 'tool_result':
+      return {
+        type: 'tool_result',
+        index,
+        tool_use_id: cb.tool_use_id,
+        content: typeof cb.content === 'string' ? cb.content : JSON.stringify(cb.content),
+        is_error: cb.is_error ?? false,
+        isStreaming: false,
+      } satisfies ToolResultBlock;
+
+    case 'text':
+    default:
+      return {
+        type: 'text',
+        index,
+        text: cb.text ?? '',
+        isStreaming: true,
+      } satisfies TextBlock;
+  }
+}
+
+/**
+ * Apply a content_block_delta to an existing block, returning
+ * an updated copy. Immutable — does not mutate the input block.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function accumulateDelta(block: ContentBlock, delta: Record<string, any>): ContentBlock {
+  switch (delta.type) {
+    case 'text_delta':
+      if (block.type === 'text') {
+        return { ...block, text: block.text + (delta.text ?? '') };
+      }
+      return block;
+
+    case 'thinking_delta':
+      if (block.type === 'thinking') {
+        return { ...block, thinking: block.thinking + (delta.thinking ?? '') };
+      }
+      return block;
+
+    case 'input_json_delta':
+      if (block.type === 'tool_use' || block.type === 'server_tool_use') {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const prev = (block as any)._partialJson ?? '';
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return { ...block, _partialJson: prev + (delta.partial_json ?? '') } as any;
+      }
+      return block;
+
+    default:
+      return block;
+  }
+}
+
+/**
+ * Mark a block as no longer streaming (called on content_block_stop).
+ * For tool blocks, parse accumulated partial JSON into final input.
+ */
+export function finalizeBlock(block: ContentBlock): ContentBlock {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const finalized = { ...block, isStreaming: false } as any;
+
+  if (
+    (finalized.type === 'tool_use' || finalized.type === 'server_tool_use') &&
+    finalized._partialJson
+  ) {
+    try {
+      finalized.input = JSON.parse(finalized._partialJson);
+    } catch {
+      // leave input as-is if partial JSON is malformed
+    }
+    delete finalized._partialJson;
+  }
+
+  return finalized as ContentBlock;
 }
