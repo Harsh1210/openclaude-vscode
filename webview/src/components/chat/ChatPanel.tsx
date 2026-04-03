@@ -50,7 +50,6 @@ export function ChatPanel() {
 
   const {
     status: processStatus,
-    rateLimitInfo: processRateLimitInfo,
     authError,
   } = useProcessState();
 
@@ -210,7 +209,7 @@ export function ChatPanel() {
       {/* Error / rate limit banner */}
       <ErrorBanner
         status={processStatus}
-        rateLimitInfo={processRateLimitInfo ?? rateLimitInfo}
+        rateLimitInfo={rateLimitInfo}
         authError={authError}
         error={error}
       />
@@ -485,9 +484,24 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
     vscode.postMessage({ type: 'file_picker_request' });
   }, []);
 
+  const [addMenuVisible, setAddMenuVisible] = useState(false);
+  const addMenuRef = useRef<HTMLDivElement>(null);
+
   const handleAddClick = useCallback(() => {
-    vscode.postMessage({ type: 'file_picker_request' });
+    setAddMenuVisible((prev) => !prev);
   }, []);
+
+  // Click outside to dismiss add menu
+  useEffect(() => {
+    if (!addMenuVisible) return;
+    const handler = (e: MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) {
+        setAddMenuVisible(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [addMenuVisible]);
 
   const handleActiveFileClick = useCallback(() => {
     if (!activeFile) return;
@@ -610,25 +624,83 @@ function InputArea({ isStreaming, isStarting, onSend, onInterrupt, effortLevel, 
           </svg>
         </ToolbarIconButton>
 
-        <ToolbarIconButton onClick={handleAddClick} title="Add content" disabled={textareaDisabled}>
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-            <path d="M8 3v10M3 8h10" />
-          </svg>
-        </ToolbarIconButton>
-
-        <ToolbarIconButton onClick={() => {
-          const mention = '@browser ';
-          const pos = textareaRef.current?.selectionStart ?? inputValue.length;
-          const before = inputValue.slice(0, pos);
-          const after = inputValue.slice(pos);
-          setInputValue(before + mention + after);
-          requestAnimationFrame(() => textareaRef.current?.focus());
-        }} title="Reference browser (@browser)" disabled={textareaDisabled}>
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-            <circle cx="8" cy="8" r="6.5"/>
-            <path d="M8 1.5C6 4 5 6 5 8s1 4 3 6.5M8 1.5C10 4 11 6 11 8s-1 4-3 6.5M1.5 8h13"/>
-          </svg>
-        </ToolbarIconButton>
+        <div style={{ position: 'relative' }} ref={addMenuRef}>
+          <ToolbarIconButton onClick={handleAddClick} title="Add content" disabled={textareaDisabled}>
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+              <path d="M8 3v10M3 8h10" />
+            </svg>
+          </ToolbarIconButton>
+          {addMenuVisible && (
+            <div
+              style={{
+                position: 'absolute',
+                bottom: '100%',
+                left: 0,
+                marginBottom: 4,
+                minWidth: 200,
+                background: 'var(--app-panel-background, var(--vscode-editorWidget-background))',
+                border: '1px solid var(--app-input-border)',
+                borderRadius: 'var(--corner-radius-small)',
+                boxShadow: '0 2px 8px rgba(0,0,0,0.25)',
+                zIndex: 50,
+                overflow: 'hidden',
+              }}
+            >
+              <AddContentMenuItem
+                icon={<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M13.5 7.5l-6 6a4 4 0 01-5.66-5.66l6-6a2.5 2.5 0 013.54 3.54l-6 6a1 1 0 01-1.42-1.42l5.5-5.5" /></svg>}
+                label="Upload from computer"
+                onClick={() => {
+                  vscode.postMessage({ type: 'file_picker_request' });
+                  setAddMenuVisible(false);
+                }}
+              />
+              <AddContentMenuItem
+                icon={<span style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: 14 }}>@</span>}
+                label="Add context"
+                onClick={() => {
+                  setAddMenuVisible(false);
+                  if (textareaRef.current) {
+                    const pos = textareaRef.current.selectionStart;
+                    const before = inputValue.slice(0, pos);
+                    const after = inputValue.slice(pos);
+                    setInputValue(before + '@' + after);
+                    requestAnimationFrame(() => {
+                      if (textareaRef.current) {
+                        const newPos = pos + 1;
+                        textareaRef.current.selectionStart = newPos;
+                        textareaRef.current.selectionEnd = newPos;
+                        textareaRef.current.focus();
+                        detectTriggers(before + '@' + after, newPos);
+                      }
+                    });
+                  }
+                }}
+              />
+              <AddContentMenuItem
+                icon={<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><circle cx="8" cy="8" r="6.5"/><path d="M8 1.5C6 4 5 6 5 8s1 4 3 6.5M8 1.5C10 4 11 6 11 8s-1 4-3 6.5M1.5 8h13"/></svg>}
+                label="Browse the web"
+                onClick={() => {
+                  setAddMenuVisible(false);
+                  if (textareaRef.current) {
+                    const pos = textareaRef.current.selectionStart;
+                    const before = inputValue.slice(0, pos);
+                    const after = inputValue.slice(pos);
+                    const mention = '@browser ';
+                    setInputValue(before + mention + after);
+                    requestAnimationFrame(() => {
+                      if (textareaRef.current) {
+                        const newPos = pos + mention.length;
+                        textareaRef.current.selectionStart = newPos;
+                        textareaRef.current.selectionEnd = newPos;
+                        textareaRef.current.focus();
+                      }
+                    });
+                  }
+                }}
+              />
+            </div>
+          )}
+        </div>
 
         {/* Spacer */}
         <div style={{ flex: 1 }} />
@@ -745,6 +817,46 @@ function ToolbarIconButton({
       }}
     >
       {children}
+    </button>
+  );
+}
+
+function AddContentMenuItem({
+  icon,
+  label,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        width: '100%',
+        padding: '6px 12px',
+        border: 'none',
+        background: 'transparent',
+        color: 'var(--app-primary-foreground)',
+        fontSize: 12,
+        cursor: 'pointer',
+        textAlign: 'left',
+      }}
+      onMouseEnter={(e) => {
+        (e.currentTarget as HTMLButtonElement).style.background = 'var(--app-ghost-button-hover-background, var(--vscode-list-hoverBackground))';
+      }}
+      onMouseLeave={(e) => {
+        (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
+      }}
+    >
+      <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 16, flexShrink: 0, opacity: 0.7 }}>
+        {icon}
+      </span>
+      <span>{label}</span>
     </button>
   );
 }

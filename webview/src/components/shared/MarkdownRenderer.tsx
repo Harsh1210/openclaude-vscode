@@ -21,7 +21,6 @@ export function MarkdownRenderer({ content, isStreaming = false }: MarkdownRende
       >
         {content}
       </ReactMarkdown>
-      {isStreaming && <StreamingCursor />}
     </div>
   );
 }
@@ -137,12 +136,3 @@ function extractTextContent(children: React.ReactNode): string {
   return String(children ?? '');
 }
 
-/** Blinking cursor shown at the end of streaming text */
-function StreamingCursor() {
-  return (
-    <span
-      className="inline-block w-2 h-4 bg-vscode-fg animate-pulse ml-0.5 align-text-bottom"
-      aria-hidden="true"
-    />
-  );
-}

@@ -13,19 +13,31 @@ interface UseSlashCommandsReturn {
   isLoaded: boolean;
 }
 
+/** OpenClaude-specific commands that are always available */
+const OPENCLAUDE_COMMANDS: SlashCommandDef[] = [
+  { name: 'provider', description: 'Set up and save a third-party provider profile', argumentHint: '' },
+];
+
+/** Merge OpenClaude-specific commands into the list (avoiding duplicates) */
+function mergeOpenClaudeCommands(cmds: SlashCommandDef[]): SlashCommandDef[] {
+  const existing = new Set(cmds.map((c) => c.name));
+  const toAdd = OPENCLAUDE_COMMANDS.filter((c) => !existing.has(c.name));
+  return [...cmds, ...toAdd];
+}
+
 /**
  * Hook for slash command menu. Listens for the command list from the
  * initialize response (sent by extension host as `slash_commands_available`).
  */
 export function useSlashCommands(): UseSlashCommandsReturn {
-  const [commands, setCommands] = useState<SlashCommandDef[]>([]);
+  const [commands, setCommands] = useState<SlashCommandDef[]>(mergeOpenClaudeCommands([]));
   const [isLoaded, setIsLoaded] = useState(false);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
       const message = event.data;
       if (message.type === 'slash_commands_available') {
-        setCommands(message.commands);
+        setCommands(mergeOpenClaudeCommands(message.commands));
         setIsLoaded(true);
       }
       // Also extract slash_commands from system/init message
@@ -43,7 +55,7 @@ export function useSlashCommands(): UseSlashCommandsReturn {
               argumentHint: typeof name === 'object' ? (name as Record<string, unknown>).argument_hint as string || '' : '',
             })).filter((c) => c.name);
             if (cmds.length > 0) {
-              setCommands(cmds);
+              setCommands(mergeOpenClaudeCommands(cmds));
               setIsLoaded(true);
             }
           }

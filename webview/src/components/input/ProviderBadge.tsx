@@ -12,6 +12,7 @@ const BUILTIN_PROVIDERS = [
   { id: 'openai', label: 'OpenAI', requiresApiKey: true, requiresBaseUrl: false, supportsModel: true, defaultBaseUrl: 'https://api.openai.com/v1' },
   { id: 'gemini', label: 'Google Gemini', requiresApiKey: true, requiresBaseUrl: false, supportsModel: true },
   { id: 'ollama', label: 'Ollama (Local)', requiresApiKey: false, requiresBaseUrl: false, supportsModel: true, defaultBaseUrl: 'http://localhost:11434/v1' },
+  { id: 'codex', label: 'Codex (ChatGPT)', requiresApiKey: true, requiresBaseUrl: false, supportsModel: true, defaultBaseUrl: 'https://api.codex.openai.com/v1' },
   { id: 'bedrock', label: 'AWS Bedrock', requiresApiKey: false, requiresBaseUrl: false, supportsModel: true },
   { id: 'vertex', label: 'Google Vertex AI', requiresApiKey: false, requiresBaseUrl: false, supportsModel: true },
   { id: 'github', label: 'GitHub Models', requiresApiKey: true, requiresBaseUrl: false, supportsModel: true },
@@ -29,6 +30,17 @@ export function ProviderBadge() {
   // Request provider state on mount
   useEffect(() => {
     vscode.postMessage({ type: 'get_provider_state' });
+  }, []);
+
+  // Listen for open_provider_picker message (e.g. from /provider command)
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      if (event.data?.type === 'open_provider_picker') {
+        setPickerOpen(true);
+      }
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
   }, []);
 
   // Listen for provider_state messages from extension host
@@ -109,6 +121,7 @@ function ProviderIcon({ providerId }: { providerId: string }) {
     openai: '⬡',
     ollama: '🦙',
     gemini: '✦',
+    codex: '⬡',
     bedrock: '☁',
     vertex: '▲',
     github: '⬢',

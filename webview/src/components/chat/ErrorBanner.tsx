@@ -59,7 +59,7 @@ export function ErrorBanner({
   const isVisible =
     !dismissed &&
     (status === 'crashed' ||
-      status === 'rate_limited' ||
+      !!rateLimitInfo ||
       status === 'auth_error' ||
       (!!error && status !== 'running' && status !== 'starting' && status !== 'idle'));
 

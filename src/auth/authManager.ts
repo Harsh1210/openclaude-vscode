@@ -70,6 +70,35 @@ const PROVIDER_DEFINITIONS: ProviderDefinition[] = [
     supportsModel: true,
   },
   {
+    id: 'codex',
+    label: 'Codex (ChatGPT)',
+    requiresApiKey: true,
+    requiresBaseUrl: false,
+    supportsModel: true,
+    defaultBaseUrl: 'https://api.codex.openai.com/v1',
+  },
+  {
+    id: 'bedrock',
+    label: 'AWS Bedrock',
+    requiresApiKey: false,
+    requiresBaseUrl: false,
+    supportsModel: true,
+  },
+  {
+    id: 'vertex',
+    label: 'Google Vertex AI',
+    requiresApiKey: false,
+    requiresBaseUrl: false,
+    supportsModel: true,
+  },
+  {
+    id: 'github',
+    label: 'GitHub Models',
+    requiresApiKey: true,
+    requiresBaseUrl: false,
+    supportsModel: true,
+  },
+  {
     id: 'custom',
     label: 'Custom (OpenAI-compatible)',
     requiresApiKey: true,
@@ -189,6 +218,13 @@ export class AuthManager {
       case 'gemini':
         if (apiKey) env['OPENAI_API_KEY'] = apiKey;
         if (baseUrl) env['OPENAI_BASE_URL'] = baseUrl;
+        env['CLAUDE_CODE_USE_OPENAI'] = '1';
+        break;
+
+      case 'codex':
+        if (apiKey) env['OPENAI_API_KEY'] = apiKey;
+        if (baseUrl) env['OPENAI_BASE_URL'] = baseUrl;
+        else if (def.defaultBaseUrl) env['OPENAI_BASE_URL'] = def.defaultBaseUrl;
         env['CLAUDE_CODE_USE_OPENAI'] = '1';
         break;
 

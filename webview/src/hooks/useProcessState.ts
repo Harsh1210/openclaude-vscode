@@ -18,7 +18,6 @@ export interface RateLimitInfo {
 
 export function useProcessState() {
   const [status, setStatus] = useState<ProcessStatus>('idle');
-  const [rateLimitInfo, setRateLimitInfo] = useState<RateLimitInfo | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -28,26 +27,9 @@ export function useProcessState() {
 
       if (data.type === 'process_state') {
         setStatus(data.state as ProcessStatus);
-        // Clear rate limit / auth error when process recovers
+        // Clear auth error when process recovers
         if (data.state === 'running') {
-          setRateLimitInfo(null);
           setAuthError(null);
-        }
-        return;
-      }
-
-      // Handle rate_limit_event from cli_output envelope
-      if (data.type === 'cli_output' && data.data?.type === 'rate_limit_event') {
-        const info = data.data.rate_limit_info as Record<string, unknown> | undefined;
-        if (info) {
-          const resetsAt = info.resetsAt as number;
-          const rateLimitType = (info.rateLimitType as string) ?? 'unknown';
-          setStatus('rate_limited');
-          setRateLimitInfo({
-            resetsAt,
-            rateLimitType,
-            message: `Rate limited (${rateLimitType}). Resets at ${new Date(resetsAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`,
-          });
         }
         return;
       }
@@ -67,5 +49,5 @@ export function useProcessState() {
     return () => window.removeEventListener('message', handler);
   }, []);
 
-  return { status, rateLimitInfo, authError, setStatus };
+  return { status, authError, setStatus };
 }
