@@ -2,14 +2,31 @@ import * as vscode from 'vscode';
 import { WebviewManager } from './webview/webviewManager';
 import { OpenClaudeWebviewProvider, OpenClaudePanelSerializer } from './webview/webviewProvider';
 import { ProcessManager, ProcessState } from './process/processManager';
+import { createDiffContentProviders } from './diff/diffContentProvider';
+import { DiffManager } from './diff/diffManager';
 
 let webviewManager: WebviewManager | undefined;
+let diffManagerInstance: DiffManager | undefined;
+
+/** Get the active DiffManager instance (available after activation). */
+export function getDiffManager(): DiffManager | undefined {
+  return diffManagerInstance;
+}
 
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel('OpenClaude', { log: true });
   context.subscriptions.push(output);
 
   output.info('OpenClaude VS Code extension activated');
+
+  // === Diff system: register URI schemes and create DiffManager ===
+  const { original, proposed, disposables: diffProviderDisposables } =
+    createDiffContentProviders();
+  context.subscriptions.push(...diffProviderDisposables);
+
+  const diffManager = new DiffManager(original, proposed, output);
+  context.subscriptions.push(diffManager);
+  diffManagerInstance = diffManager;
 
   // Create the WebviewManager — central orchestrator for all panels
   webviewManager = new WebviewManager(context.extensionUri, context, output);
@@ -234,13 +251,24 @@ export function activate(context: vscode.ExtensionContext) {
     }),
   );
 
+  // === Diff commands (real implementations) ===
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.acceptProposedDiff', () => {
+      diffManager.acceptCurrentDiff();
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openclaude.rejectProposedDiff', () => {
+      diffManager.rejectCurrentDiff();
+    }),
+  );
+
   // Register remaining commands as no-ops (implementations come in later stories)
   const noopCommands = [
     'openclaude.terminal.open',
     'openclaude.terminal.open.keyboard',
     'openclaude.createWorktree',
-    'openclaude.acceptProposedDiff',
-    'openclaude.rejectProposedDiff',
     'openclaude.update',
     'openclaude.installPlugin',
     'openclaude.logout',
@@ -349,5 +377,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   console.log('OpenClaude VS Code extension deactivated');
+  diffManagerInstance = undefined;
   webviewManager = undefined;
 }
