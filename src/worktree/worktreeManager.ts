@@ -20,7 +20,7 @@ export function sanitizeWorktreeName(name: string): string {
     .replace(/\s+/g, '-')
     .replace(/\//g, '-')            // slash → hyphen (before dot handling)
     .replace(/\.{2,}/g, '-')        // consecutive dots → hyphen
-    .replace(/[~^:?*\[\]\\@{}<>]/g, '-')
+    .replace(/[~^:?*[\]\\@{}<>]/g, '-')
     .replace(/-{2,}/g, '-')         // collapse consecutive hyphens
     .replace(/^\.+|\.+$/g, '');     // no leading/trailing dots
 
