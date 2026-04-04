@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import * as path from 'node:path';
 
 describe('WorktreeManager helpers', () => {
   describe('sanitizeWorktreeName', () => {
@@ -42,7 +43,7 @@ describe('WorktreeManager helpers', () => {
       const { deriveWorktreePath } = await import('../../src/worktree/worktreeManager');
 
       expect(deriveWorktreePath('/home/user/myrepo', 'feature-auth')).toBe(
-        '/home/user/myrepo-worktrees/feature-auth',
+        path.join('/home/user/myrepo-worktrees', 'feature-auth'),
       );
     });
 
@@ -50,7 +51,7 @@ describe('WorktreeManager helpers', () => {
       const { deriveWorktreePath } = await import('../../src/worktree/worktreeManager');
 
       expect(deriveWorktreePath('/home/user/myrepo', 'fix', '/tmp/worktrees')).toBe(
-        '/tmp/worktrees/fix',
+        path.join('/tmp/worktrees', 'fix'),
       );
     });
   });

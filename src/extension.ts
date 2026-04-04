@@ -15,6 +15,7 @@ import { CheckpointManager } from './checkpoint/checkpointManager';
 import type { RewindFilesResponse } from './checkpoint/checkpointManager';
 import { AuthManager } from './auth/authManager';
 import { SettingsSync } from './settings/settingsSync';
+import { resolveCliExecutable } from './settings/cliExecutable';
 import { McpIdeServer } from './mcp/mcpIdeServer';
 import { normalizePluginState, buildToggleRequest, buildInstallCommand, buildReloadRequest } from './plugins/pluginBridge';
 import { WorktreeManager } from './worktree/worktreeManager';
@@ -217,6 +218,7 @@ export function activate(context: vscode.ExtensionContext) {
     webviewManager!.broadcast({ type: 'process_state', state: 'starting' });
 
     const config = vscode.workspace.getConfiguration('openclaudeCode');
+    const executable = resolveCliExecutable(config);
     const permissionMode = config.get<string>('initialPermissionMode') as
       | 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions' | 'dontAsk' | undefined;
 
@@ -226,6 +228,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     processManager = new ProcessManager({
       cwd: workspaceFolder.uri.fsPath,
+      executable,
       model,
       permissionMode,
       env,
@@ -584,6 +587,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     const config = vscode.workspace.getConfiguration('openclaudeCode');
+    const executable = resolveCliExecutable(config);
     const model = config.get<string>('selectedModel');
     const permissionMode = config.get<string>('initialPermissionMode') as
       | 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions' | 'dontAsk' | undefined;
@@ -601,6 +605,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     processManager = new ProcessManager({
       cwd: workspaceFolder.uri.fsPath,
+      executable,
       model: model !== 'default' ? model : undefined,
       permissionMode,
       sessionId: message.sessionId,
@@ -746,8 +751,12 @@ export function activate(context: vscode.ExtensionContext) {
       const forkOptions = checkpointManager.buildForkOptions(msg.messageUuid);
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
       if (!workspaceFolder) return;
+      const executable = resolveCliExecutable(
+        vscode.workspace.getConfiguration('openclaudeCode'),
+      );
       const forkPm = new ProcessManager({
         cwd: workspaceFolder.uri.fsPath,
+        executable,
         sessionId: forkOptions.sessionId,
         forkSession: forkOptions.forkSession,
         env: authManager.buildProcessEnv(),
@@ -766,8 +775,12 @@ export function activate(context: vscode.ExtensionContext) {
       const forkOptions = checkpointManager.buildForkOptions(msg.messageUuid);
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
       if (!workspaceFolder) return;
+      const executable = resolveCliExecutable(
+        vscode.workspace.getConfiguration('openclaudeCode'),
+      );
       const forkPm = new ProcessManager({
         cwd: workspaceFolder.uri.fsPath,
+        executable,
         sessionId: forkOptions.sessionId,
         forkSession: forkOptions.forkSession,
         env: authManager.buildProcessEnv(),

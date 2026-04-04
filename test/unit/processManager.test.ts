@@ -12,6 +12,16 @@ vi.mock('node:child_process', () => ({
 // Import after mocking
 import { ProcessManager, ProcessState } from '../../src/process/processManager';
 
+const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+const originalComSpec = process.env.ComSpec;
+
+function setPlatform(platform: NodeJS.Platform) {
+  Object.defineProperty(process, 'platform', {
+    configurable: true,
+    value: platform,
+  });
+}
+
 function createMockProcess(exitCode: number | null = null) {
   const proc = new NodeEventEmitter() as NodeEventEmitter & {
     stdin: PassThrough;
@@ -40,6 +50,8 @@ describe('ProcessManager', () => {
   let mockProc: ReturnType<typeof createMockProcess>;
 
   beforeEach(() => {
+    setPlatform('linux');
+    delete process.env.ComSpec;
     mockProc = createMockProcess();
     mockSpawn.mockReturnValue(mockProc);
     manager = new ProcessManager({
@@ -51,6 +63,15 @@ describe('ProcessManager', () => {
   afterEach(() => {
     manager.dispose();
     vi.clearAllMocks();
+
+    if (originalPlatformDescriptor) {
+      Object.defineProperty(process, 'platform', originalPlatformDescriptor);
+    }
+    if (originalComSpec === undefined) {
+      delete process.env.ComSpec;
+    } else {
+      process.env.ComSpec = originalComSpec;
+    }
   });
 
   describe('spawn', () => {
@@ -178,6 +199,84 @@ describe('ProcessManager', () => {
         'openclaude',
         expect.arrayContaining(['--resume', 'abc-123']),
         expect.any(Object),
+      );
+    });
+
+    it('should launch bare commands through cmd.exe on Windows', () => {
+      setPlatform('win32');
+      process.env.ComSpec = 'C:\\Windows\\System32\\cmd.exe';
+
+      manager = new ProcessManager({
+        cwd: 'C:\\work\\project',
+        executable: 'openclaude',
+        model: 'gpt-4o',
+        permissionMode: 'plan',
+        sessionId: 'abc-123',
+        worktree: 'feature branch',
+        env: {
+          OPENAI_API_KEY: 'sk-test',
+        },
+      });
+
+      manager.spawn();
+
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'C:\\Windows\\System32\\cmd.exe',
+        [
+          '/d',
+          '/s',
+          '/c',
+          expect.stringContaining('openclaude'),
+        ],
+        expect.objectContaining({
+          cwd: 'C:\\work\\project',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+          env: expect.objectContaining({
+            OPENAI_API_KEY: 'sk-test',
+          }),
+        }),
+      );
+
+      const commandLine = mockSpawn.mock.calls[0]?.[1]?.[3] as string;
+      expect(commandLine).toContain('--output-format');
+      expect(commandLine).toContain('stream-json');
+      expect(commandLine).toContain('--input-format');
+      expect(commandLine).toContain('--verbose');
+      expect(commandLine).toContain('--model');
+      expect(commandLine).toContain('gpt-4o');
+      expect(commandLine).toContain('--permission-mode');
+      expect(commandLine).toContain('plan');
+      expect(commandLine).toContain('--resume');
+      expect(commandLine).toContain('abc-123');
+      expect(commandLine).toContain('--worktree');
+      expect(commandLine).toContain('"feature branch"');
+    });
+
+    it('should launch cmd wrapper paths through cmd.exe on Windows', () => {
+      setPlatform('win32');
+      process.env.ComSpec = 'C:\\Windows\\System32\\cmd.exe';
+
+      manager = new ProcessManager({
+        cwd: 'C:\\work\\project',
+        executable: 'C:\\Users\\Test User\\AppData\\Roaming\\npm\\openclaude.cmd',
+      });
+
+      manager.spawn();
+
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'C:\\Windows\\System32\\cmd.exe',
+        [
+          '/d',
+          '/s',
+          '/c',
+          '"C:\\Users\\Test User\\AppData\\Roaming\\npm\\openclaude.cmd" --output-format stream-json --verbose --input-format stream-json',
+        ],
+        expect.objectContaining({
+          cwd: 'C:\\work\\project',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+        }),
       );
     });
   });

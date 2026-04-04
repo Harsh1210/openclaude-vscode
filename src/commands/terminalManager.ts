@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { resolveCliExecutable } from '../settings/cliExecutable';
 
 /**
  * Manages the OpenClaude integrated terminal instance.
@@ -30,7 +31,7 @@ export class TerminalManager implements vscode.Disposable {
     }
 
     const config = vscode.workspace.getConfiguration('openclaudeCode');
-    const cliCommand = config.get<string>('claudeProcessWrapper', '') || 'openclaude';
+    const cliCommand = resolveCliExecutable(config);
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
     const envVars = config.get<Array<{ name: string; value: string }>>(

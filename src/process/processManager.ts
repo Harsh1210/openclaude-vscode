@@ -6,6 +6,7 @@
 // Reference: Claude Code extension.js class `Qm` (ProcessTransport) and `fm` (Query)
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { NdjsonTransport } from './ndjsonTransport';
 import { ControlRouter, type ControlRequestHandler } from './controlRouter';
@@ -70,6 +71,53 @@ type ErrorCallback = (error: Error) => void;
 type ExitCallback = (code: number | null, signal: string | null) => void;
 type StderrCallback = (line: string) => void;
 type StateCallback = (state: ProcessState) => void;
+
+interface SpawnCommand {
+  executable: string;
+  args: string[];
+}
+
+function isBareWindowsCommand(executable: string): boolean {
+  return !/[\\/]/.test(executable) && path.win32.extname(executable) === '';
+}
+
+function isWindowsBatchWrapper(executable: string): boolean {
+  const ext = path.win32.extname(executable).toLowerCase();
+  return ext === '.cmd' || ext === '.bat';
+}
+
+function quoteForWindowsCmd(arg: string): string {
+  if (arg.length === 0) {
+    return '""';
+  }
+
+  if (!/[\s"&()<>^|]/.test(arg)) {
+    return arg;
+  }
+
+  return `"${arg.replace(/"/g, '""')}"`;
+}
+
+function resolveSpawnCommand(executable: string, args: string[]): SpawnCommand {
+  if (
+    process.platform === 'win32' &&
+    (isBareWindowsCommand(executable) || isWindowsBatchWrapper(executable))
+  ) {
+    // npm installs `openclaude` on Windows as a `.cmd` shim, which must be
+    // launched through `cmd.exe` for PATH/PATHEXT resolution to work reliably.
+    return {
+      executable: process.env.ComSpec?.trim() || 'cmd.exe',
+      args: [
+        '/d',
+        '/s',
+        '/c',
+        [executable, ...args].map(quoteForWindowsCmd).join(' '),
+      ],
+    };
+  }
+
+  return { executable, args };
+}
 
 // ============================================================================
 // ProcessManager
@@ -137,12 +185,13 @@ export class ProcessManager {
 
     this.setState(ProcessState.Spawning);
 
-    const executable = this.options.executable ?? 'openclaude';
+    const executable = (this.options.executable ?? 'openclaude').trim() || 'openclaude';
     const args = this.buildArgs();
     const env = this.buildEnv();
+    const spawnCommand = resolveSpawnCommand(executable, args);
 
     try {
-      this.process = spawn(executable, args, {
+      this.process = spawn(spawnCommand.executable, spawnCommand.args, {
         cwd: this.options.cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
         env,
