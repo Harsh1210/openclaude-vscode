@@ -2,7 +2,7 @@
 	"name": "openclaude-vscode",
 	"displayName": "OpenClaude VS Code",
 	"description": "OpenClaude VS Code: AI coding assistant powered by any LLM",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"publisher": "HarshAgarwal1012",
 	"license": "MIT",
 	"bugs": {
@@ -130,6 +130,21 @@
 					"type": "boolean",
 					"default": true,
 					"markdownDescription": "Automatically activate the workspace's Python environment when running OpenClaude. Requires the [Python](https://marketplace.visualstudio.com/items?itemName=ms-python.python) extension."
+				},
+				"openclaudeCode.selectedProvider": {
+					"type": "string",
+					"default": "anthropic",
+					"description": "The selected AI provider for OpenClaude."
+				},
+				"openclaudeCode.apiKey": {
+					"type": "string",
+					"default": "",
+					"description": "API key for the selected provider."
+				},
+				"openclaudeCode.baseUrl": {
+					"type": "string",
+					"default": "",
+					"description": "Base URL for the selected provider (for custom/OpenAI-compatible providers)."
 				}
 			}
 		},
