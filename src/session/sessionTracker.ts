@@ -330,15 +330,25 @@ export class SessionTracker implements vscode.Disposable {
    * Returns them in order for replaying into the webview on resume.
    */
   async loadSessionMessages(sessionId: string): Promise<Array<Record<string, unknown>>> {
-    const session = this.sessions.get(sessionId);
-    if (!session) {
+    // Try sessions map first, then construct the path as fallback
+    let filePath = this.sessions.get(sessionId)?.filePath;
+    if (!filePath) {
+      const projectDir = this.getProjectDirForWorkspace();
+      if (projectDir) {
+        const candidate = path.join(this.getProjectsDir(), projectDir, `${sessionId}.jsonl`);
+        if (fs.existsSync(candidate)) {
+          filePath = candidate;
+        }
+      }
+    }
+    if (!filePath) {
       return [];
     }
 
     const messages: Array<Record<string, unknown>> = [];
 
     try {
-      const fileStream = fs.createReadStream(session.filePath, { encoding: 'utf-8' });
+      const fileStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
       const rl = readline.createInterface({
         input: fileStream,
         crlfDelay: Infinity,
@@ -355,10 +365,14 @@ export class SessionTracker implements vscode.Disposable {
           continue;
         }
 
-        // Only include user and assistant messages (skip meta, system, result, etc.)
-        if (entry.type === 'user' && !entry.isMeta) {
+        const type = entry.type as string | undefined;
+
+        // Include user messages (skip meta/synthetic context injections)
+        if (type === 'user' && !entry.isMeta) {
           messages.push(entry);
-        } else if (entry.type === 'assistant') {
+        }
+        // Include assistant messages
+        else if (type === 'assistant') {
           messages.push(entry);
         }
       }

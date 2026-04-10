@@ -8,9 +8,10 @@ import { StreamingIndicator } from './StreamingIndicator';
 interface MessageListProps {
   messages: ChatMessage[];
   isStreaming: boolean;
+  processState?: 'idle' | 'starting' | 'running' | 'stopped' | 'crashed';
 }
 
-export function MessageList({ messages, isStreaming }: MessageListProps) {
+export function MessageList({ messages, isStreaming, processState }: MessageListProps) {
   const { containerRef, userScrolledUp, autoScroll, scrollToBottom } = useAutoScroll();
 
   // Auto-scroll when messages change or streaming content updates
@@ -25,7 +26,7 @@ export function MessageList({ messages, isStreaming }: MessageListProps) {
         className="messages-container"
         style={{ justifyContent: 'center', alignItems: 'center' }}
       >
-        <EmptyState />
+        {processState === 'starting' ? <LoadingState /> : <EmptyState />}
       </div>
     );
   }
@@ -96,6 +97,16 @@ function EmptyState() {
         <div style={{ fontSize: '2em', marginBottom: 12 }}>{"{ }"}</div>
         <p style={{ fontSize: '0.85em', fontWeight: 500, marginBottom: 4 }}>No messages yet</p>
         <p style={{ fontSize: '0.75em' }}>Type a message below to start a conversation.</p>
+      </div>
+    </div>
+  );
+}
+
+function LoadingState() {
+  return (
+    <div className="empty-state">
+      <div className="empty-state-content" style={{ opacity: 0.5, padding: '0 20px' }}>
+        <p style={{ fontSize: '0.85em', fontWeight: 500 }}>Loading session...</p>
       </div>
     </div>
   );

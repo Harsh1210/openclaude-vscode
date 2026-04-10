@@ -152,7 +152,7 @@ export function ChatPanel() {
       </div>
 
       {/* Message list */}
-      <MessageList messages={messages} isStreaming={isStreaming} />
+      <MessageList messages={messages} isStreaming={isStreaming} processState={processState} />
 
       {/* Onboarding checklist */}
       {showOnboarding && (

@@ -478,20 +478,25 @@ export function useChat() {
           const historyMsgs: ChatMessage[] = [];
           for (const entry of data.messages as Array<Record<string, unknown>>) {
             if (entry.type === 'user') {
-              const msg = entry.message as Record<string, unknown> | undefined;
-              if (!msg) continue;
-              const content = msg.content;
+              // Handle both { message: { content } } and direct content formats
+              const msg = (typeof entry.message === 'object' && entry.message)
+                ? entry.message as Record<string, unknown>
+                : null;
+              const content = msg?.content ?? entry.content;
               let text = '';
               if (typeof content === 'string') {
                 text = content;
               } else if (Array.isArray(content)) {
-                const textBlock = content.find(
-                  (b: Record<string, unknown>) => b.type === 'text',
-                );
-                if (textBlock && typeof textBlock.text === 'string') {
-                  text = textBlock.text;
+                // Collect all text blocks (not just the first)
+                const texts: string[] = [];
+                for (const b of content as Array<Record<string, unknown>>) {
+                  if (b.type === 'text' && typeof b.text === 'string') {
+                    texts.push(b.text);
+                  }
                 }
+                text = texts.join('\n') || '[tool interaction]';
               }
+              if (!text) text = '[message]';
               historyMsgs.push({
                 id: (entry.uuid as string) || `user-hist-${historyMsgs.length}`,
                 role: 'user',
@@ -501,9 +506,11 @@ export function useChat() {
                 parentToolUseId: (entry.parent_tool_use_id as string) || null,
               });
             } else if (entry.type === 'assistant') {
-              const msg = entry.message as Record<string, unknown> | undefined;
-              if (!msg) continue;
-              const contentArr = (msg.content || []) as Array<Record<string, unknown>>;
+              const msg = (typeof entry.message === 'object' && entry.message)
+                ? entry.message as Record<string, unknown>
+                : null;
+              const rawContent = msg?.content ?? entry.content;
+              const contentArr = Array.isArray(rawContent) ? rawContent as Array<Record<string, unknown>> : [];
               const blocks = contentArr.map((block, index) => ({
                 index,
                 block: block as unknown as import('../types/messages').ContentBlock,
@@ -516,7 +523,7 @@ export function useChat() {
                 isStreaming: false,
                 timestamp: entry.timestamp ? new Date(entry.timestamp as string).getTime() : Date.now(),
                 parentToolUseId: (entry.parent_tool_use_id as string) || null,
-                model: (msg.model as string) || undefined,
+                model: (msg?.model as string) || undefined,
               });
             }
           }
