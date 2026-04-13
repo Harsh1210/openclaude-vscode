@@ -219,7 +219,12 @@ export function activate(context: vscode.ExtensionContext) {
 
     const config = vscode.workspace.getConfiguration('openclaudeCode');
     const executable = resolveCliExecutable(config);
-    const permissionMode = config.get<string>('initialPermissionMode') as
+    // Use the permission handler's current mode (reflects user's UI selection),
+    // falling back to the config default only on first launch
+    const handlerMode = permissionHandler.getMode();
+    const permissionMode = (handlerMode !== 'default'
+      ? handlerMode
+      : config.get<string>('initialPermissionMode')) as
       | 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions' | 'dontAsk' | undefined;
 
     // Use AuthManager to build env vars (merges provider env + user env vars)
