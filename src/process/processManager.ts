@@ -196,7 +196,7 @@ export class ProcessManager {
         stdio: ['pipe', 'pipe', 'pipe'],
         env,
         windowsHide: true,
-        shell: process.platform === 'win32',
+        shell: true,
       });
     } catch (err) {
       this.setState(ProcessState.Idle);

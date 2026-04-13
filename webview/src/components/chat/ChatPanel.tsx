@@ -76,12 +76,18 @@ export function ChatPanel() {
     return !localStorage.getItem('openclaude.onboarding.dismissed');
   });
 
+  // Track whether the user has explicitly changed the permission mode this session
+  const userSetModeRef = useRef(false);
+
   // Listen for system init messages to get the initial permission mode
   useEffect(() => {
     const unsub = vscode.onMessage('cli_output', (message) => {
       const data = message.data as Record<string, unknown> | undefined;
       if (data?.type === 'system' && data.subtype === 'init' && typeof data.permissionMode === 'string') {
-        setPermissionMode(data.permissionMode as PermissionModeValue);
+        // Only apply init's permission mode if the user hasn't explicitly changed it
+        if (!userSetModeRef.current) {
+          setPermissionMode(data.permissionMode as PermissionModeValue);
+        }
       }
       // Load company announcements from init
       if (data?.type === 'system' && data.subtype === 'init' && Array.isArray(data.companyAnnouncements)) {
@@ -107,6 +113,7 @@ export function ChatPanel() {
   // Rate limit countdown timer is now handled inside ErrorBanner component
 
   const handleModeChange = useCallback((mode: PermissionModeValue) => {
+    userSetModeRef.current = true;
     setPermissionMode(mode);
     vscode.postMessage({ type: 'set_permission_mode', mode });
   }, []);
@@ -133,7 +140,7 @@ export function ChatPanel() {
           sessionTitle={sessionTitle}
           isSessionListOpen={isSessionListOpen}
           onToggleSessionList={() => setSessionListOpen(!isSessionListOpen)}
-          onNewConversation={newConversation}
+          onNewConversation={() => { userSetModeRef.current = false; newConversation(); }}
         />
 
         {/* Session list overlay */}

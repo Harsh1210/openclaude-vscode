@@ -2,7 +2,7 @@
 	"name": "openclaude-vscode",
 	"displayName": "OpenClaude VS Code",
 	"description": "OpenClaude VS Code: AI coding assistant powered by any LLM",
-	"version": "0.2.4",
+	"version": "0.2.5",
 	"publisher": "HarshAgarwal1012",
 	"license": "MIT",
 	"bugs": {
